@@ -12,6 +12,7 @@
     <StackPanel Grid.Row="0" Margin="2,0,2,12">
       <TextBlock Text="Reader settings" FontSize="24" FontWeight="SemiBold" Foreground="#20342D" />
       <TextBlock Margin="0,4,0,0" Text="Saved on this PC. Settings affect EPUB reading only." Foreground="#65726B" />
+      <CheckBox x:Name="BookTypographyOverrideCheck" Margin="0,8,0,0" Content="Save typography and spacing for this book only" ToolTip="Only typography and spacing become book-specific; reminders and display options remain global." />
     </StackPanel>
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
       <StackPanel Margin="2,0,8,0">
@@ -155,6 +156,20 @@
               </ComboBox>
             </Grid>
             <TextBlock Margin="0,10,0,0" Text="Screen orientation lock and hardware volume-key navigation are Android-only; use the Windows window controls and keyboard instead." FontSize="12" Foreground="#65726B" TextWrapping="Wrap" />
+          </StackPanel>
+        </Border>
+        <Border Padding="14" Margin="0,0,0,12" Background="White" BorderBrush="#D9DEDA" BorderThickness="1" CornerRadius="8">
+          <StackPanel>
+            <TextBlock Text="Daily reading reminder" FontSize="17" FontWeight="SemiBold" Foreground="#275D50" />
+            <CheckBox x:Name="DailyReminderEnabledCheck" Margin="0,10,0,0" Content="Remind me once each day" Checked="ControlChanged" Unchecked="ControlChanged" />
+            <Grid Margin="0,8,0,0">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="170"/><ColumnDefinition Width="*"/><ColumnDefinition Width="110"/></Grid.ColumnDefinitions>
+              <TextBlock Text="Reminder time (24-hour)" VerticalAlignment="Center" />
+              <TextBox x:Name="DailyReminderTimeBox" Grid.Column="1" MaxLength="5" Width="90" HorizontalAlignment="Left" Padding="8,5" ToolTip="Use HH:mm, for example 20:30" />
+            </Grid>
+            <CheckBox x:Name="DailyReminderOnlyIfUnreadCheck" Margin="170,8,0,0" Content="Only remind me if I have not read today" />
+            <CheckBox x:Name="DailyReminderStreakNudgeCheck" Margin="170,6,0,0" Content="Mention my current reading streak" />
+            <TextBlock Margin="170,6,0,0" Text="This best-effort Windows reminder appears only while WoW Reader is running; it is not a background notification after the app closes." FontSize="12" Foreground="#65726B" TextWrapping="Wrap" />
           </StackPanel>
         </Border>
       </StackPanel>

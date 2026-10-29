@@ -32,8 +32,10 @@ The package is MIT licensed. Its upstream license text is:
 >
 > THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## Other assets
+## WoW Reader brand artwork
 
-No book content, sample EPUBs, fonts, dictionary data, or other third-party assets are included. Only use materials whose rights and license terms have been verified before adding them. The WebView2 Evergreen Runtime is a separate Windows component; see Microsoft's [distribution guidance](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution).
+`src/WowReader.Windows/Assets/wow-logo.svg` and `wow-reader-icon.svg` are Windows-compatible vector ports of the project-owned Android source artwork in the public [WoW Reader logo](https://github.com/whispermmepub/wow-reader-lab/blob/main/app/src/main/res/drawable/wow_logo.xml) and [launcher icon](https://github.com/whispermmepub/wow-reader-lab/blob/main/app/src/main/res/drawable/ic_launcher.xml). Their PNG/ICO forms are rasterized from those vectors for the Windows splash, window, and executable icon. No Android build output is included.
+
+No book content, sample EPUBs, fonts, dictionary data, or unrelated third-party assets are included. Only use materials whose rights and license terms have been verified before adding them. The WebView2 Evergreen Runtime is a separate Windows component; see Microsoft's [distribution guidance](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution).
 
 The CI workflow references GitHub's `actions/checkout`, `actions/setup-dotnet`, and `actions/upload-artifact` (all pinned to major version 4). These action repositories are MIT licensed; see their upstream notices: <https://github.com/actions/checkout/blob/main/LICENSE>, <https://github.com/actions/setup-dotnet/blob/main/LICENSE>, and <https://github.com/actions/upload-artifact/blob/main/LICENSE>.

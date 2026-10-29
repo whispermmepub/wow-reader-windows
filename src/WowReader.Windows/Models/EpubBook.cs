@@ -7,7 +7,8 @@ public sealed record EpubBook(
     string Title,
     string SourcePath,
     string ExtractedRoot,
-    IReadOnlyList<EpubChapter> Chapters)
+    IReadOnlyList<EpubChapter> Chapters,
+    string Author = "")
 {
     public int OverallPercent(int chapterIndex, double chapterFraction)
     {

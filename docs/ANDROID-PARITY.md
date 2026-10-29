@@ -1,35 +1,54 @@
-# Android-to-Windows reader settings coverage
+# Android-to-Windows feature coverage
 
-The Windows companion implements a local-first EPUB reader with Windows-appropriate equivalents for the core Android reading modes and typography settings. The Android reference used for this comparison is public `main` at commit `46b8d578f3a67771863ce996ce95bb5141c884db`. The existing Android checkout was left untouched. Android source is not a Windows build dependency.
+WoW Reader for Windows is a separate local-first WPF app, based on the public Windows repository. The Android app in `whispermmepub/wow-reader-lab` was used as a read-only behavior reference; this work did not modify that repository or copy its book data, fonts, dictionary assets, credentials, signing material, or other unlicensed content. Android source is not a Windows build dependency. Project-owned code remains under the PolyForm Noncommercial License 1.0.0.
 
-## Implemented in Windows
+## Available in Windows
 
-- **Reading flow:** `Page by page` uses horizontal viewport columns and previous/next page controls; `Vertical scroll` uses normal document scrolling. Progress is stored per book and restored as a normalized chapter position in either mode. Left/right arrow keys turn pages in page mode.
-- **Page movement:** `None · default` or `Smooth slide`. Page Curl is not implemented on Windows.
-- **EPUB formatting:** `Original EPUB` preserves publisher typography/layout where possible; `Reader settings` applies reader-controlled line spacing, margins, weight, and alignment. `Auto Space` applies language-aware Myanmar/Latin justification CSS for justified Reader settings. It is smart text justification, not extra paragraph spacing.
-- **Typography:** font size 80–300% (default 100%), weight 200–800 (default 400%), line height 1.20–2.20 (default 1.60), and margins 1–14% (default 5%). Alignment choices are Original, Justify, Left, and Right. The existing picker uses publisher fonts, installed Windows fonts, and user-imported local TTF/OTF/WOFF/WOFF2 fonts.
-- **Auto scroll:** Off by default, Vertical scroll only, speed 1–10 (default 4, using Android's approximate speed mapping), Whole book or This chapter (default Whole book). User input pauses it briefly; Whole book advances at chapter boundaries.
-- **Appearance:** Light, Sepia, Dark, E-Ink, and Custom themes, plus optional `#RRGGBB` text/background overrides. Night Light supports Off, On, and Auto (local 7pm–6am). Brightness supports System or 40/60/80/100% using an app-content dimming overlay, not monitor backlight control.
-- **Reading helpers:** Keep display awake while the app is open, a configurable reading ruler (1–20 lines), a 30-minute eye-break reminder, and book/chapter/mode position labels.
-- **Storage:** reader settings are versioned JSON under `%LOCALAPPDATA%\\WoWReader\\reader-settings.json`; reading positions and imported font catalog remain in their existing local files. Nothing is uploaded.
+### Home and Library
 
-## Differences and remaining gaps
+Home is the landing page and provides continue-reading, a local activity summary, and routes to the available screens. The app keeps the branded splash, Windows icon, and an exit confirmation with today's locally tracked reading time.
 
-- The Android experimental Page Curl animation is unavailable; Windows offers None and Smooth slide only.
-- Android's bundled Myanmar fonts are not copied. Windows offers fonts already installed on Windows and fonts the owner imports, subject to the owner's license rights.
-- Android text-size uses WebView text zoom. Windows currently uses WebView2 zoom, which can scale images and other content as well as text; exact reflow is therefore not pixel-identical.
-- Android hardware orientation lock, hardware volume-key navigation, and system-bar immersive behavior do not map directly to a desktop window. The settings panel explains these differences rather than pretending to control them.
-- Windows brightness is an in-reader overlay rather than hardware display brightness. Night Light Auto is a local time schedule.
-- Settings currently use one global reader profile. Android's optional per-book typography override store is not implemented.
-- The Android project also includes TOC, search, bookmarks, notes/highlights, dictionary actions, and PDF paths. These are not provided by this Windows EPUB settings update; PDF remains unsupported.
-- Windows EPUB reflow, page columns, script shaping, publisher CSS, and accessibility still need verification with the owner's own authorized books and fonts on Windows/WebView2.
+The Library imports local EPUB and PDF files. It searches by title, author, series, and shelf; filters by reading state and shelf; and sorts by recent addition, title, author, or rating. Book details can store a title, author, series, description, 1–5 rating, and multiple shelf names. A user-selected cover image can be copied into the local library after basic file-size, format, and dimensions checks. Use only cover images you have permission to use. Books and metadata stay on this PC.
 
-## Suggested Windows checks
+### Reading and reader settings
 
-1. Switch between Page by page and Vertical scroll; resize the window; confirm position is retained and page arrows/left-right keys behave sensibly.
-2. Compare Original EPUB with Reader settings on books with fixed publisher fonts, margins, headings, and images. Confirm the original setting remains legible and Reader controls apply only in Reader mode.
-3. Try Myanmar-only and mixed Myanmar/Latin justified text with Auto Space on and off, plus a user-owned Myanmar font. Confirm no Android font or book data is bundled.
-4. Try the font-size, weight, line-height, and margin limits; then close/reopen the book and app to verify persistence.
-5. Test Auto scroll in chapter-only and whole-book modes, pause after wheel/keyboard input, and confirm it stops at the end of the book.
-6. Test Light/Sepia/Dark/E-Ink/Custom colors, Night Light Off/On/Auto, content brightness overlay, ruler, display-awake behavior, and the eye reminder.
-7. Verify that all library, settings, progress, and imported-font data remain below `%LOCALAPPDATA%\\WoWReader\\` and that no sign-in or sync is introduced.
+For EPUBs, the reader supports chapter navigation, saved reading position, Page by page and Vertical scroll modes, contents, full-book text search, bookmarks, notes/highlights, and the existing typography, theme, ruler, auto-scroll, keep-awake, brightness-dimming, and eye-break options. Typography settings can be scoped to an individual EPUB; other reader settings remain global.
+
+PDFs open in the Microsoft Edge WebView2 built-in PDF viewer. WoW Reader tracks foreground reading time and finished/in-progress state for a PDF, but does not save its page position or provide its own PDF annotation layer or EPUB typography controls. PDF rendering depends on the installed WebView2 Runtime; see [Microsoft's WebView2 PDF documentation](https://learn.microsoft.com/en-us/deployedge/microsoft-edge-pdf).
+
+The Vocabulary window can capture selected EPUB text, store words and user-written meanings locally, mark terms learned or needing review, and run simple flashcard review. Online lookup is an explicit user action that opens the term on Wiktionary in the default browser. No dictionary database is bundled.
+
+### Explore, statistics, and Calendar
+
+Explore is an optional page that requests a small set of public feed URLs only when opened or refreshed. It shows sanitized text snippets and source links, uses an allowlist and bounded local cache, and does not send personal reading data. Opening a post hands the link to the user's default browser; feed availability depends on network/source availability.
+
+Statistics show local reading time, active days, current and longest streaks, weekly bars, sessions, per-book time, and manually finished-book count. Activity is sampled while a book is open and the app window is foreground, so the duration is an estimate, not proof of active attention.
+
+Calendar supports Month, Week, and Year views. Selecting a day shows reading time, sessions, and books read; the user can save a private daily note and a separate memory for each book tracked on that date. Statistics can export a current-month recap as a PNG. The recap omits book titles and private notes.
+
+### Local storage and privacy
+
+Books, PDFs, cover images, reader settings and per-book typography overrides, progress, activity journal, bookmarks, notes/highlights, daily Calendar notes and per-book memories, vocabulary, Explore cache, completion state, and imported fonts remain below `%LOCALAPPDATA%\WoWReader\`. Explore and explicit Wiktionary lookup are the only new user-facing network actions; reading data is not uploaded. There is no Google/Firebase sign-in, account, Drive integration, or cross-device sync. Sync requires separate owner approval.
+
+## Genuinely platform-specific or unavailable behavior
+
+- Android hardware-orientation lock, volume-key navigation, immersive system-bar behavior, Android lifecycle hooks, Android sharing intents, and Play Store integrations do not map directly to this desktop app. Windows brightness is a reader dimming layer, not monitor backlight control.
+- Daily reading reminders appear as an in-app toast while WoW Reader is running. Windows does not currently schedule a native background notification after the app is closed; reminders are disabled by default.
+- PDF page position, annotations, and the Android PDF reading-mode controls are not stored or implemented by WoW Reader. The embedded viewer uses WebView2/Edge's own PDF experience.
+- Explore is a small public feed, not a personalized catalogue or recommendation service. Dictionary definitions are not bundled; users add meanings themselves or deliberately open Wiktionary.
+- The splash and shell do not mirror every Android app-theme palette. WebView2 rendering, publisher CSS, fonts, and pagination can differ from Android; desktop zoom may scale images as well as text.
+- Android reading history is not imported. Activity on Windows begins locally and is not merged across devices.
+
+## Validation and Windows test checklist
+
+A Release build of `WowReader.Windows.sln` targeting `net10.0-windows` has compiled successfully in the sandbox, and `git diff --check` passes. This validates compilation, not interactive Windows runtime behavior; the sandbox does not provide the Windows desktop runtime. The packaged app still needs validation on a Windows PC with the Microsoft Edge WebView2 Evergreen Runtime.
+
+1. Import authorized EPUB and PDF files; verify they remain under `%LOCALAPPDATA%\WoWReader\` and survive restart.
+2. Try Library search, author/title/rating sorting, Reading/Unread/Finished filters, shelves, cover selection/removal, and manual completion.
+3. Compare EPUB Page by page and Vertical scroll, contents, search, bookmarks, notes/highlights, and saved progress after reopening.
+4. Try PDF reading and its built-in toolbar; confirm the documented lack of WoW Reader page-position and annotation storage.
+5. Capture selected words, add a meaning, mark it learned, use flashcard review, and verify that Wiktionary opens only after the explicit lookup action.
+6. Open/refresh Explore online and offline; verify cache behavior and that no personal reading data is required.
+7. Inspect Month, Week, and Year views, save a day note and per-book memory, export a PNG recap, and verify that private titles/notes are absent.
+8. Try typography scope, reminder settings/toast, the 30-minute eye-break reminder, imported owner-authorized fonts, and a complex EPUB.
+9. Confirm the app still has no sign-in, reading-data upload, Google/Firebase integration, or Drive/cross-device sync.

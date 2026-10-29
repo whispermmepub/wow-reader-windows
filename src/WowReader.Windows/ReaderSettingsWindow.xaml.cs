@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
@@ -8,13 +9,18 @@ namespace WowReader.Windows;
 public partial class ReaderSettingsWindow : Window
 {
     private bool _isInitializing;
+    private readonly bool _hasCurrentBook;
 
     public ReaderSettings Settings { get; private set; }
     public bool ResetRequested { get; private set; }
+    public bool UseBookTypography => _hasCurrentBook && BookTypographyOverrideCheck.IsChecked == true;
 
-    public ReaderSettingsWindow(ReaderSettings current)
+    public ReaderSettingsWindow(ReaderSettings current, bool hasCurrentBook = false, bool hasTypographyOverride = false)
     {
         InitializeComponent();
+        _hasCurrentBook = hasCurrentBook;
+        BookTypographyOverrideCheck.IsEnabled = hasCurrentBook;
+        BookTypographyOverrideCheck.IsChecked = hasCurrentBook && hasTypographyOverride;
         Settings = current.Clone();
         InitializeValues(Settings);
     }
@@ -44,6 +50,10 @@ public partial class ReaderSettingsWindow : Window
         RulerLinesSlider.Value = settings.ReadingRulerLines;
         EyeBreakReminderCheck.IsChecked = settings.EyeBreakReminder;
         SetSelection(PositionDisplayPicker, settings.PositionDisplayMode.ToString());
+        DailyReminderEnabledCheck.IsChecked = settings.DailyReadingReminderEnabled;
+        DailyReminderTimeBox.Text = $"{settings.DailyReadingReminderHour:00}:{settings.DailyReadingReminderMinute:00}";
+        DailyReminderOnlyIfUnreadCheck.IsChecked = settings.DailyReminderOnlyIfUnread;
+        DailyReminderStreakNudgeCheck.IsChecked = settings.DailyReminderStreakNudge;
         _isInitializing = false;
         UpdateValueLabels();
         UpdateDependentEnabledState();
@@ -51,6 +61,16 @@ public partial class ReaderSettingsWindow : Window
 
     private void ApplyButton_Click(object sender, RoutedEventArgs e)
     {
+        var oldReminderDate = Settings.DailyReminderLastDeliveredDate;
+        var reminderEnabled = DailyReminderEnabledCheck.IsChecked == true;
+        var validReminderTime = TimeOnly.TryParseExact(DailyReminderTimeBox.Text.Trim(), "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var reminderTime);
+        if (!validReminderTime && reminderEnabled)
+        {
+            MessageBox.Show(this, "Enter the daily reminder time as HH:mm using a 24-hour clock.",
+                "Check the reminder time", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        if (!validReminderTime) reminderTime = new TimeOnly(Settings.DailyReadingReminderHour, Settings.DailyReadingReminderMinute);
         if (!TryReadColor(CustomTextColorBox.Text, out var textColor)
             || !TryReadColor(CustomBackgroundColorBox.Text, out var backgroundColor))
         {
@@ -82,7 +102,13 @@ public partial class ReaderSettingsWindow : Window
             ReadingRulerEnabled = ReadingRulerCheck.IsChecked == true,
             ReadingRulerLines = Whole(RulerLinesSlider.Value),
             EyeBreakReminder = EyeBreakReminderCheck.IsChecked == true,
-            PositionDisplayMode = int.TryParse(Selected(PositionDisplayPicker, "0"), out var positionMode) ? positionMode : 0
+            PositionDisplayMode = int.TryParse(Selected(PositionDisplayPicker, "0"), out var positionMode) ? positionMode : 0,
+            DailyReadingReminderEnabled = DailyReminderEnabledCheck.IsChecked == true,
+            DailyReadingReminderHour = reminderTime.Hour,
+            DailyReadingReminderMinute = reminderTime.Minute,
+            DailyReminderOnlyIfUnread = DailyReminderOnlyIfUnreadCheck.IsChecked == true,
+            DailyReminderStreakNudge = DailyReminderStreakNudgeCheck.IsChecked == true,
+            DailyReminderLastDeliveredDate = oldReminderDate
         };
         Settings.Normalize();
         DialogResult = true;
@@ -152,6 +178,10 @@ public partial class ReaderSettingsWindow : Window
         MarginSlider.IsEnabled = readerFormatting;
         AlignmentPicker.IsEnabled = readerFormatting;
         AutoSpacingCheck.IsEnabled = readerFormatting && Selected(AlignmentPicker, "original") == "justify";
+        var dailyReminderEnabled = DailyReminderEnabledCheck.IsChecked == true;
+        DailyReminderTimeBox.IsEnabled = dailyReminderEnabled;
+        DailyReminderOnlyIfUnreadCheck.IsEnabled = dailyReminderEnabled;
+        DailyReminderStreakNudgeCheck.IsEnabled = dailyReminderEnabled;
     }
 
     private static int Whole(double value) => (int)Math.Round(value, MidpointRounding.AwayFromZero);

@@ -30,6 +30,8 @@ public sealed class ReadingProgressStore
     public ReadingPosition Get(string bookId) =>
         _positions.TryGetValue(bookId, out var position) ? position : ReadingPosition.Start;
 
+    public bool Has(string bookId) => _positions.ContainsKey(bookId);
+
     public void Save(string bookId, int chapterIndex, double scrollFraction)
     {
         if (bookId.Length != 64 || !bookId.All(char.IsAsciiHexDigit))

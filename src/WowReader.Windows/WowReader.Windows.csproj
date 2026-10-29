@@ -8,9 +8,16 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>WowReader.Windows</RootNamespace>
     <AssemblyName>WowReader.Windows</AssemblyName>
+    <ApplicationIcon>Assets\wow-reader.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4314.35" />
     <PackageReference Include="HtmlAgilityPack" Version="1.13.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Assets\wow-logo.png" />
+    <Resource Include="Assets\wow-reader-icon.png" />
+    <None Update="Assets\wow-logo.svg" />
+    <None Update="Assets\wow-reader-icon.svg" />
   </ItemGroup>
 </Project>

@@ -102,7 +102,7 @@ public sealed class EpubBookService
             throw new InvalidDataException("The EPUB package has no readable spine chapters.");
         }
 
-        return new EpubBook(bookId, parsed.Title, bookPath, cacheDirectory, chapters);
+        return new EpubBook(bookId, parsed.Title, bookPath, cacheDirectory, chapters, parsed.Author);
     }
 
     private static string ComputeSha256(string filePath, CancellationToken cancellationToken)
@@ -220,6 +220,12 @@ public sealed class EpubBookService
         {
             title = Path.GetFileNameWithoutExtension(packagePath);
         }
+        var author = string.Join(", ", package.Descendants()
+            .Where(element => element.Name.LocalName == "creator")
+            .Select(element => element.Value.Trim())
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.CurrentCultureIgnoreCase)
+            .Take(5));
 
         var manifest = package.Descendants().Where(element => element.Name.LocalName == "item")
             .Select(element => new
@@ -262,7 +268,7 @@ public sealed class EpubBookService
             chapterList.Add(new ParsedChapter(archivePath, string.IsNullOrWhiteSpace(label) ? $"Chapter {chapterList.Count + 1}" : label, weight));
         }
 
-        return new ParsedPackage(title, chapterList);
+        return new ParsedPackage(title, author, chapterList);
     }
 
     private static XDocument LoadXml(string path)
@@ -437,6 +443,6 @@ public sealed class EpubBookService
         return value.StartsWith("data:", StringComparison.OrdinalIgnoreCase) && !allowDataImage;
     }
 
-    private sealed record ParsedPackage(string Title, IReadOnlyList<ParsedChapter> Chapters);
+    private sealed record ParsedPackage(string Title, string Author, IReadOnlyList<ParsedChapter> Chapters);
     private sealed record ParsedChapter(string ArchivePath, string Title, long Weight);
 }

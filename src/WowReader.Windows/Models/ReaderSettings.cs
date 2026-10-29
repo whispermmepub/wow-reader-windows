@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace WowReader.Windows.Models;
 
 public sealed class ReaderSettings
@@ -25,6 +27,12 @@ public sealed class ReaderSettings
     public int ReadingRulerLines { get; set; } = 1;
     public bool EyeBreakReminder { get; set; } = true;
     public int PositionDisplayMode { get; set; }
+    public bool DailyReadingReminderEnabled { get; set; }
+    public int DailyReadingReminderHour { get; set; } = 20;
+    public int DailyReadingReminderMinute { get; set; }
+    public bool DailyReminderOnlyIfUnread { get; set; } = true;
+    public bool DailyReminderStreakNudge { get; set; } = true;
+    public string DailyReminderLastDeliveredDate { get; set; } = "";
 
     public ReaderSettings Clone() => (ReaderSettings)MemberwiseClone();
 
@@ -47,6 +55,11 @@ public sealed class ReaderSettings
         AutoScrollSpeed = Math.Clamp(AutoScrollSpeed, 1, 10);
         ReadingRulerLines = Math.Clamp(ReadingRulerLines, 1, 20);
         PositionDisplayMode = Math.Clamp(PositionDisplayMode, 0, 2);
+        DailyReadingReminderHour = Math.Clamp(DailyReadingReminderHour, 0, 23);
+        DailyReadingReminderMinute = Math.Clamp(DailyReadingReminderMinute, 0, 59);
+        DailyReminderLastDeliveredDate = DateOnly.TryParseExact(DailyReminderLastDeliveredDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _)
+            ? DailyReminderLastDeliveredDate
+            : "";
     }
 
     private static string OneOf(string? value, params string[] allowed) =>
