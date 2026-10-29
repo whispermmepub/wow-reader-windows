@@ -11,24 +11,33 @@
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
 
-    <Border Grid.Row="0" Background="White" BorderBrush="#D9DEDA" BorderThickness="0,0,0,1" Padding="16,12">
-      <DockPanel LastChildFill="True">
-        <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
-          <Button x:Name="OpenButton" Content="Open EPUB…" Click="OpenButton_Click" />
-          <ComboBox x:Name="LibraryPicker" Width="250" Margin="8,0,12,0" VerticalContentAlignment="Center"
-                    DisplayMemberPath="Title" SelectedValuePath="Id" SelectionChanged="LibraryPicker_SelectionChanged"
-                    ToolTip="Books stored on this device" />
-          <Button x:Name="PreviousButton" Content="‹ Previous" Click="PreviousButton_Click" IsEnabled="False" />
-          <Button x:Name="NextButton" Content="Next ›" Click="NextButton_Click" IsEnabled="False" />
-          <Button x:Name="AddFontButton" Content="Add font…" Click="AddFontButton_Click" Margin="18,0,4,0" />
+    <Border Grid.Row="0" Background="White" BorderBrush="#D9DEDA" BorderThickness="0,0,0,1" Padding="16,10">
+      <Grid>
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <DockPanel Grid.Row="0" LastChildFill="True">
+          <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
+            <Button x:Name="OpenButton" Content="Open EPUB…" Click="OpenButton_Click" />
+            <ComboBox x:Name="LibraryPicker" Width="240" Margin="8,0,12,0" VerticalContentAlignment="Center"
+                      DisplayMemberPath="Title" SelectedValuePath="Id" SelectionChanged="LibraryPicker_SelectionChanged"
+                      ToolTip="Books stored on this device" />
+            <Button x:Name="PreviousButton" Content="‹ Previous" Click="PreviousButton_Click" IsEnabled="False" />
+            <Button x:Name="NextButton" Content="Next ›" Click="NextButton_Click" IsEnabled="False" Margin="4,0,0,0" />
+          </StackPanel>
+          <TextBlock x:Name="ProgressText" DockPanel.Dock="Right" Margin="16,0,0,0" Foreground="#275D50" FontWeight="SemiBold" VerticalAlignment="Center" Text="Local EPUB reader" />
+        </DockPanel>
+        <StackPanel Grid.Row="1" Margin="0,9,0,0" Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock Text="Mode" Margin="0,0,6,0" VerticalAlignment="Center" Foreground="#65726B" />
+          <ComboBox x:Name="ReadingModePicker" Width="150" VerticalContentAlignment="Center" SelectedValuePath="Tag"
+                    SelectionChanged="ReadingModePicker_SelectionChanged" ToolTip="Choose page-by-page or vertical scrolling">
+            <ComboBoxItem Content="Page by page" Tag="page"/><ComboBoxItem Content="Vertical scroll" Tag="scroll"/>
+          </ComboBox>
+          <Button x:Name="ReaderSettingsButton" Content="Reader settings…" Margin="8,0,8,0" Click="ReaderSettingsButton_Click" />
+          <Button x:Name="AddFontButton" Content="Add font…" Click="AddFontButton_Click" Margin="4,0,4,0" />
           <ComboBox x:Name="FontPicker" Width="230" Margin="4,0,8,0" VerticalContentAlignment="Center"
                     DisplayMemberPath="Name" SelectedValuePath="Id" SelectionChanged="FontPicker_SelectionChanged"
-                    ToolTip="Choose a font installed on Windows, an imported local font, or the publisher font" />
+                    ToolTip="Choose an installed Windows font, an imported local font, or the publisher font" />
         </StackPanel>
-        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
-          <TextBlock x:Name="ProgressText" Foreground="#275D50" FontWeight="SemiBold" VerticalAlignment="Center" Text="Local EPUB reader" />
-        </StackPanel>
-      </DockPanel>
+      </Grid>
     </Border>
 
     <Border Grid.Row="1" Margin="20,18" Background="White" BorderBrush="#E0E4E0" BorderThickness="1" CornerRadius="8">
@@ -36,7 +45,7 @@
         <wv2:WebView2 x:Name="ReaderBrowser" Visibility="Collapsed" />
         <StackPanel x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="560">
           <TextBlock Text="Your Windows reading space" FontSize="28" FontWeight="SemiBold" Foreground="#20342D" TextAlignment="Center" />
-          <TextBlock Margin="0,14,0,0" Text="Open an EPUB to begin. This first milestone keeps your books and reading position on this PC; nothing is uploaded." FontSize="15" Foreground="#607068" TextAlignment="Center" TextWrapping="Wrap" />
+          <TextBlock Margin="0,14,0,0" Text="Open an EPUB to begin. Your books, settings, fonts, and reading position stay on this PC; nothing is uploaded." FontSize="15" Foreground="#607068" TextAlignment="Center" TextWrapping="Wrap" />
         </StackPanel>
       </Grid>
     </Border>
