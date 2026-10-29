@@ -1,0 +1,33 @@
+# .NET build output
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+
+# IDE and local test state
+.idea/
+.vscode/
+TestResults/
+*.log
+artifacts/
+publish/
+
+# Never check local book data or app state into source control
+AppData/
+Books/
+Cache/
+Fonts/
+reading-progress.json
+library-catalog.json
+font-catalog.json
+*.epub
+*.pdf
+*.ttf
+*.otf
+*.woff
+*.woff2
+
+# OS noise
+.DS_Store
+Thumbs.db

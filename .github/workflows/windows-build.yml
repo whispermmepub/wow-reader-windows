@@ -1,0 +1,31 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Restore
+        run: dotnet restore .\WowReader.Windows.sln
+      - name: Build
+        run: dotnet build .\WowReader.Windows.sln --configuration Release --no-restore
+      - name: Publish portable Windows build
+        if: github.event_name == 'push'
+        run: dotnet publish .\src\WowReader.Windows\WowReader.Windows.csproj --configuration Release --runtime win-x64 --self-contained true --output .\artifacts\win-x64
+      - name: Create portable zip
+        if: github.event_name == 'push'
+        run: Compress-Archive -Path .\artifacts\win-x64\* -DestinationPath .\artifacts\wow-reader-windows-win-x64.zip -Force
+      - name: Upload Windows build artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wow-reader-windows-win-x64
+          path: .\artifacts\wow-reader-windows-win-x64.zip
+          retention-days: 30

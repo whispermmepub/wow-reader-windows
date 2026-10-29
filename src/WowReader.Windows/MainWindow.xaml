@@ -1,0 +1,51 @@
+<Window x:Class="WowReader.Windows.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="WoW Reader for Windows" Width="1180" Height="820" MinWidth="1000" MinHeight="560"
+        Background="#F4F5F3" Loaded="Window_Loaded" Closing="Window_Closing">
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+      <RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
+
+    <Border Grid.Row="0" Background="White" BorderBrush="#D9DEDA" BorderThickness="0,0,0,1" Padding="16,12">
+      <DockPanel LastChildFill="True">
+        <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
+          <Button x:Name="OpenButton" Content="Open EPUB…" Click="OpenButton_Click" />
+          <ComboBox x:Name="LibraryPicker" Width="250" Margin="8,0,12,0" VerticalContentAlignment="Center"
+                    DisplayMemberPath="Title" SelectedValuePath="Id" SelectionChanged="LibraryPicker_SelectionChanged"
+                    ToolTip="Books stored on this device" />
+          <Button x:Name="PreviousButton" Content="‹ Previous" Click="PreviousButton_Click" IsEnabled="False" />
+          <Button x:Name="NextButton" Content="Next ›" Click="NextButton_Click" IsEnabled="False" />
+          <Button x:Name="AddFontButton" Content="Add font…" Click="AddFontButton_Click" Margin="18,0,4,0" />
+          <ComboBox x:Name="FontPicker" Width="230" Margin="4,0,8,0" VerticalContentAlignment="Center"
+                    DisplayMemberPath="Name" SelectedValuePath="Id" SelectionChanged="FontPicker_SelectionChanged"
+                    ToolTip="Choose a font installed on Windows, an imported local font, or the publisher font" />
+        </StackPanel>
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock x:Name="ProgressText" Foreground="#275D50" FontWeight="SemiBold" VerticalAlignment="Center" Text="Local EPUB reader" />
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <Border Grid.Row="1" Margin="20,18" Background="White" BorderBrush="#E0E4E0" BorderThickness="1" CornerRadius="8">
+      <Grid>
+        <wv2:WebView2 x:Name="ReaderBrowser" Visibility="Collapsed" />
+        <StackPanel x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="560">
+          <TextBlock Text="Your Windows reading space" FontSize="28" FontWeight="SemiBold" Foreground="#20342D" TextAlignment="Center" />
+          <TextBlock Margin="0,14,0,0" Text="Open an EPUB to begin. This first milestone keeps your books and reading position on this PC; nothing is uploaded." FontSize="15" Foreground="#607068" TextAlignment="Center" TextWrapping="Wrap" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <Border Grid.Row="2" Background="#F4F5F3" Padding="18,0,18,12">
+      <DockPanel>
+        <TextBlock x:Name="StatusText" Foreground="#65726B" FontSize="12" Text="Ready" />
+        <TextBlock DockPanel.Dock="Right" Foreground="#65726B" FontSize="12" Text="Saved locally" />
+      </DockPanel>
+    </Border>
+  </Grid>
+</Window>
