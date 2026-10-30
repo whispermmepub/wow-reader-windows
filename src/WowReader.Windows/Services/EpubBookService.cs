@@ -102,7 +102,8 @@ public sealed class EpubBookService
             throw new InvalidDataException("The EPUB package has no readable spine chapters.");
         }
 
-        return new EpubBook(bookId, parsed.Title, bookPath, cacheDirectory, chapters, parsed.Author);
+        return new EpubBook(bookId, parsed.Title, bookPath, cacheDirectory, chapters, parsed.Author,
+            parsed.Navigation.Select(item => new EpubNavigationItem(item.Title, item.ChapterIndex, item.Fragment, item.Depth)).ToArray());
     }
 
     private static string ComputeSha256(string filePath, CancellationToken cancellationToken)
@@ -232,29 +233,51 @@ public sealed class EpubBookService
             {
                 Id = (string?)element.Attribute("id"),
                 Href = (string?)element.Attribute("href"),
-                MediaType = (string?)element.Attribute("media-type")
+                MediaType = (string?)element.Attribute("media-type"),
+                Properties = (string?)element.Attribute("properties") ?? ""
             })
             .Where(item => !string.IsNullOrWhiteSpace(item.Id) && !string.IsNullOrWhiteSpace(item.Href))
-            .ToDictionary(item => item.Id!, item => (item.Href!, item.MediaType), StringComparer.Ordinal);
+            .ToDictionary(item => item.Id!, item => new ManifestItem(item.Href!, item.MediaType, item.Properties), StringComparer.Ordinal);
 
         var packageDirectory = Path.GetDirectoryName(packagePath)?.Replace(Path.DirectorySeparatorChar, '/') ?? string.Empty;
+        var navEntry = manifest.FirstOrDefault(pair => HasToken(pair.Value.Properties, "nav"));
+        var navItemId = navEntry.Value is null ? null : navEntry.Key;
+        var navArchivePath = navEntry.Value is null ? null : ResolveArchivePath(packageDirectory, navEntry.Value.Href);
+        var spine = package.Descendants().FirstOrDefault(element => element.Name.LocalName == "spine");
+        var ncxId = (string?)spine?.Attribute("toc");
+        ManifestItem? ncxItem = null;
+        if (ncxId is not null && manifest.TryGetValue(ncxId, out var referencedNcx)
+            && string.Equals(referencedNcx.MediaType, "application/x-dtbncx+xml", StringComparison.OrdinalIgnoreCase))
+        {
+            ncxItem = referencedNcx;
+        }
+        else
+        {
+            ncxItem = manifest.Values.FirstOrDefault(item =>
+                string.Equals(item.MediaType, "application/x-dtbncx+xml", StringComparison.OrdinalIgnoreCase));
+        }
+        var ncxArchivePath = ncxItem is null ? null : ResolveArchivePath(packageDirectory, ncxItem.Href);
         var chapterList = new List<ParsedChapter>();
-        foreach (var itemref in package.Descendants().Where(element => element.Name.LocalName == "itemref"))
+        foreach (var itemref in spine?.Elements().Where(element => element.Name.LocalName == "itemref") ?? [])
         {
             var idref = (string?)itemref.Attribute("idref");
             if (idref is null || !manifest.TryGetValue(idref, out var item)
-                || item.MediaType is not ("application/xhtml+xml" or "text/html"))
+                || item.MediaType is not ("application/xhtml+xml" or "text/html")
+                || string.Equals(idref, navItemId, StringComparison.Ordinal))
             {
                 continue;
             }
-            var archivePath = ResolveArchivePath(packageDirectory, item.Item1);
+            var archivePath = ResolveArchivePath(packageDirectory, item.Href);
+            if (string.Equals(archivePath, navArchivePath, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
             var path = GetContainedPath(extractedRoot, archivePath);
             if (!File.Exists(path))
             {
                 continue;
             }
-            var rawHtml = File.ReadAllText(path);
-            var document = LoadHtml(rawHtml);
+            var document = LoadHtml(File.ReadAllText(path));
             RemoveUnsafeMarkup(document);
             var textLength = document.DocumentNode.InnerText.Trim().Length;
             var basename = Path.GetFileNameWithoutExtension(archivePath);
@@ -264,11 +287,178 @@ public sealed class EpubBookService
                 || basename.Contains("titlepage", StringComparison.OrdinalIgnoreCase)
                 || basename.Contains("copyright", StringComparison.OrdinalIgnoreCase);
             var weight = frontMatter && textLength < 30_000 ? 1L : Math.Max(250L, textLength);
-            var label = basename.Replace('_', ' ').Replace('-', ' ').Trim();
-            chapterList.Add(new ParsedChapter(archivePath, string.IsNullOrWhiteSpace(label) ? $"Chapter {chapterList.Count + 1}" : label, weight));
+            chapterList.Add(new ParsedChapter(archivePath, GetDocumentTitle(document, archivePath, chapterList.Count + 1), weight));
         }
 
-        return new ParsedPackage(title, author, chapterList);
+        var chapterIndices = chapterList.Select((chapter, index) => (chapter.ArchivePath, index))
+            .ToDictionary(item => item.ArchivePath, item => item.index, StringComparer.OrdinalIgnoreCase);
+        var navigation = new List<ParsedNavigation>();
+        if (navArchivePath is not null)
+        {
+            var navPath = GetContainedPath(extractedRoot, navArchivePath);
+            if (File.Exists(navPath)) navigation.AddRange(ParseEpub3Navigation(navPath, navArchivePath, chapterIndices));
+        }
+        if (navigation.Count == 0 && ncxArchivePath is not null)
+        {
+            var ncxPath = GetContainedPath(extractedRoot, ncxArchivePath);
+            if (File.Exists(ncxPath)) navigation.AddRange(ParseEpub2Navigation(ncxPath, ncxArchivePath, chapterIndices));
+        }
+
+        for (var index = 0; index < chapterList.Count; index++)
+        {
+            var bestLabel = navigation.Where(item => item.ChapterIndex == index && item.Title.Length > 0)
+                .OrderBy(item => item.Depth)
+                .ThenBy(item => item.Fragment.Length > 0 ? 1 : 0)
+                .Select(item => item.Title)
+                .FirstOrDefault();
+            if (bestLabel is not null) chapterList[index] = chapterList[index] with { Title = bestLabel };
+        }
+        if (navigation.Count == 0)
+        {
+            navigation.AddRange(chapterList.Select((chapter, index) => new ParsedNavigation(chapter.Title, index, "", 0)));
+        }
+        return new ParsedPackage(title, author, chapterList, navigation);
+    }
+
+    private static IReadOnlyList<ParsedNavigation> ParseEpub3Navigation(string navPath, string navArchivePath, IReadOnlyDictionary<string, int> chapterIndices)
+    {
+        var document = LoadHtml(File.ReadAllText(navPath));
+        var navNodes = document.DocumentNode.SelectNodes("//nav")?.ToList() ?? [];
+        var tocNav = navNodes.FirstOrDefault(node => node.Attributes.Any(attribute =>
+            (attribute.Name.Equals("epub:type", StringComparison.OrdinalIgnoreCase)
+                || attribute.Name.Equals("type", StringComparison.OrdinalIgnoreCase)
+                || attribute.Name.Equals("role", StringComparison.OrdinalIgnoreCase))
+            && (attribute.Value ?? "").Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+                .Any(value => value.Equals("toc", StringComparison.OrdinalIgnoreCase)
+                    || value.Equals("doc-toc", StringComparison.OrdinalIgnoreCase))));
+        var nav = tocNav ?? navNodes.FirstOrDefault();
+        var list = nav?.SelectSingleNode("./ol") ?? nav?.SelectSingleNode(".//ol");
+        if (list is null) return [];
+
+        var results = new List<ParsedNavigation>();
+        var navDirectory = Path.GetDirectoryName(navArchivePath)?.Replace(Path.DirectorySeparatorChar, '/') ?? "";
+        CollectEpub3Navigation(list, navDirectory, chapterIndices, 0, results);
+        return results;
+    }
+
+    private static void CollectEpub3Navigation(HtmlNode list, string navDirectory,
+        IReadOnlyDictionary<string, int> chapterIndices, int depth, List<ParsedNavigation> results)
+    {
+        foreach (var item in list.ChildNodes.Where(node => node.Name.Equals("li", StringComparison.OrdinalIgnoreCase)))
+        {
+            var link = item.SelectSingleNode("./a[@href]")
+                ?? item.SelectSingleNode("./p/a[@href]")
+                ?? item.SelectSingleNode("./span/a[@href]");
+            if (link is not null)
+            {
+                var title = CleanNavigationLabel(link.InnerText);
+                if (title.Length == 0)
+                {
+                    title = CleanNavigationLabel(link.SelectSingleNode(".//img[@alt]")?.GetAttributeValue("alt", "") ?? "");
+                }
+                if (title.Length > 0 && TryResolveNavigationTarget(link.GetAttributeValue("href", ""), navDirectory,
+                    chapterIndices, out var chapterIndex, out var fragment))
+                {
+                    results.Add(new ParsedNavigation(title, chapterIndex, fragment, depth));
+                }
+            }
+
+            foreach (var childList in item.ChildNodes.Where(node => node.Name.Equals("ol", StringComparison.OrdinalIgnoreCase)))
+            {
+                CollectEpub3Navigation(childList, navDirectory, chapterIndices, depth + 1, results);
+            }
+        }
+    }
+
+    private static IReadOnlyList<ParsedNavigation> ParseEpub2Navigation(string ncxPath, string ncxArchivePath, IReadOnlyDictionary<string, int> chapterIndices)
+    {
+        XDocument document;
+        try
+        {
+            document = LoadXml(ncxPath);
+        }
+        catch (Exception exception) when (exception is XmlException or IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+        var navMap = document.Descendants().FirstOrDefault(element => element.Name.LocalName == "navMap");
+        if (navMap is null) return [];
+
+        var results = new List<ParsedNavigation>();
+        var ncxDirectory = Path.GetDirectoryName(ncxArchivePath)?.Replace(Path.DirectorySeparatorChar, '/') ?? "";
+        CollectNcxNavigation(navMap, ncxDirectory, chapterIndices, 0, results);
+        return results;
+    }
+
+    private static void CollectNcxNavigation(XElement parent, string ncxDirectory,
+        IReadOnlyDictionary<string, int> chapterIndices, int depth, List<ParsedNavigation> results)
+    {
+        foreach (var point in parent.Elements().Where(element => element.Name.LocalName == "navPoint"))
+        {
+            var label = point.Elements().FirstOrDefault(element => element.Name.LocalName == "navLabel")?
+                .Descendants().FirstOrDefault(element => element.Name.LocalName == "text")?.Value ?? "";
+            var source = (string?)point.Elements().FirstOrDefault(element => element.Name.LocalName == "content")?.Attribute("src");
+            var title = CleanNavigationLabel(label);
+            if (source is not null && title.Length > 0
+                && TryResolveNavigationTarget(source, ncxDirectory, chapterIndices, out var chapterIndex, out var fragment))
+            {
+                results.Add(new ParsedNavigation(title, chapterIndex, fragment, depth));
+            }
+            CollectNcxNavigation(point, ncxDirectory, chapterIndices, depth + 1, results);
+        }
+    }
+
+    private static bool TryResolveNavigationTarget(string href, string baseDirectory,
+        IReadOnlyDictionary<string, int> chapterIndices, out int chapterIndex, out string fragment)
+    {
+        chapterIndex = -1;
+        fragment = "";
+        try
+        {
+            var hash = href.IndexOf('#');
+            if (hash >= 0 && hash + 1 < href.Length)
+            {
+                var fragmentValue = href[(hash + 1)..];
+                var query = fragmentValue.IndexOf('?');
+                fragment = Uri.UnescapeDataString(query >= 0 ? fragmentValue[..query] : fragmentValue);
+            }
+            var archivePath = ResolveArchivePath(baseDirectory, href);
+            return chapterIndices.TryGetValue(archivePath, out chapterIndex);
+        }
+        catch (Exception exception) when (exception is InvalidDataException or UriFormatException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static string CleanNavigationLabel(string? value)
+    {
+        var decoded = HtmlEntity.DeEntitize(value ?? "");
+        return string.Join(' ', decoded.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).Trim();
+    }
+
+    private static bool HasToken(string values, string token) =>
+        values.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .Any(value => value.Equals(token, StringComparison.OrdinalIgnoreCase));
+
+    private static string GetDocumentTitle(HtmlDocument document, string archivePath, int chapterNumber)
+    {
+        var basename = Path.GetFileNameWithoutExtension(archivePath).Replace('_', ' ').Replace('-', ' ').Trim();
+        foreach (var selector in new[] { "//h1", "//h2", "//title" })
+        {
+            var candidate = CleanNavigationLabel(document.DocumentNode.SelectSingleNode(selector)?.InnerText);
+            if (candidate.Length > 0 && !IsGenericDocumentTitle(candidate, basename)) return candidate;
+        }
+        return IsGenericDocumentTitle(basename, basename) ? $"Chapter {chapterNumber}" : basename;
+    }
+
+    private static bool IsGenericDocumentTitle(string title, string basename)
+    {
+        var normalized = title.Trim().Replace('_', ' ').Replace('-', ' ');
+        return normalized.Length == 0
+            || normalized.Equals(basename, StringComparison.OrdinalIgnoreCase)
+            || new[] { "index", "toc", "nav", "contents", "table of contents", "untitled", "cover", "titlepage" }
+                .Contains(normalized, StringComparer.OrdinalIgnoreCase);
     }
 
     private static XDocument LoadXml(string path)
@@ -443,6 +633,8 @@ public sealed class EpubBookService
         return value.StartsWith("data:", StringComparison.OrdinalIgnoreCase) && !allowDataImage;
     }
 
-    private sealed record ParsedPackage(string Title, string Author, IReadOnlyList<ParsedChapter> Chapters);
+    private sealed record ManifestItem(string Href, string? MediaType, string Properties);
+    private sealed record ParsedPackage(string Title, string Author, IReadOnlyList<ParsedChapter> Chapters, IReadOnlyList<ParsedNavigation> Navigation);
     private sealed record ParsedChapter(string ArchivePath, string Title, long Weight);
+    private sealed record ParsedNavigation(string Title, int ChapterIndex, string Fragment, int Depth);
 }

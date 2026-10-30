@@ -1,7 +1,7 @@
 <Window x:Class="WowReader.Windows.ReaderSettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Reader settings" Width="760" Height="820" MinWidth="620" MinHeight="620"
+        Title="Reader settings" Width="760" Height="700" MinWidth="620" MinHeight="520" ShowInTaskbar="False"
         WindowStartupLocation="CenterOwner" ResizeMode="CanResizeWithGrip" Background="#F4F5F3">
   <Grid Margin="18">
     <Grid.RowDefinitions>
@@ -103,22 +103,25 @@
             <Grid Margin="0,10,0,0">
               <Grid.ColumnDefinitions><ColumnDefinition Width="170"/><ColumnDefinition Width="*"/><ColumnDefinition Width="110"/></Grid.ColumnDefinitions>
               <TextBlock Text="Theme" VerticalAlignment="Center" />
-              <ComboBox x:Name="ThemePicker" Grid.Column="1" SelectedValuePath="Tag" SelectionChanged="SelectionChanged">
-                <ComboBoxItem Content="Light" Tag="light"/><ComboBoxItem Content="Sepia" Tag="sepia"/><ComboBoxItem Content="Dark" Tag="dark"/><ComboBoxItem Content="E-Ink" Tag="eink"/><ComboBoxItem Content="Custom colors" Tag="custom"/>
+              <ComboBox x:Name="ThemePicker" Grid.Column="1" SelectedValuePath="Tag" SelectionChanged="ThemePicker_SelectionChanged">
+                <ComboBoxItem Content="Day · Light" Tag="light"/><ComboBoxItem Content="Sepia" Tag="sepia"/><ComboBoxItem Content="Night · Dark" Tag="dark"/><ComboBoxItem Content="E-Ink" Tag="eink"/><ComboBoxItem Content="Premium · Soft" Tag="premium"/><ComboBoxItem Content="Custom colors" Tag="custom"/>
               </ComboBox>
             </Grid>
             <Grid Margin="0,8,0,0">
               <Grid.ColumnDefinitions><ColumnDefinition Width="170"/><ColumnDefinition Width="*"/><ColumnDefinition Width="110"/></Grid.ColumnDefinitions>
               <TextBlock Text="Text color override" VerticalAlignment="Center" />
-              <TextBox x:Name="CustomTextColorBox" Grid.Column="1" MaxLength="7" ToolTip="Optional #RRGGBB override; leave blank for theme default" />
+              <TextBox x:Name="CustomTextColorBox" Grid.Column="1" MaxLength="7" TextChanged="ColorBox_TextChanged" ToolTip="Optional #RRGGBB override; leave blank for theme default" />
               <TextBlock Grid.Column="2" Text="#RRGGBB" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="#65726B" />
             </Grid>
             <Grid Margin="0,6,0,0">
               <Grid.ColumnDefinitions><ColumnDefinition Width="170"/><ColumnDefinition Width="*"/><ColumnDefinition Width="110"/></Grid.ColumnDefinitions>
               <TextBlock Text="Background override" VerticalAlignment="Center" />
-              <TextBox x:Name="CustomBackgroundColorBox" Grid.Column="1" MaxLength="7" ToolTip="Optional #RRGGBB override; leave blank for theme default" />
+              <TextBox x:Name="CustomBackgroundColorBox" Grid.Column="1" MaxLength="7" TextChanged="ColorBox_TextChanged" ToolTip="Optional #RRGGBB override; leave blank for theme default" />
               <TextBlock Grid.Column="2" Text="#RRGGBB" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="#65726B" />
             </Grid>
+            <Border x:Name="AppearancePreviewBorder" Margin="170,10,0,0" Padding="12" Background="#FFFFFF" BorderBrush="#D9DEDA" BorderThickness="1" CornerRadius="7">
+              <TextBlock x:Name="AppearancePreviewText" Text="A comfortable page to read · Aa" Foreground="#202124" FontSize="17" FontFamily="Georgia" TextWrapping="Wrap" />
+            </Border>
             <Grid Margin="0,8,0,0">
               <Grid.ColumnDefinitions><ColumnDefinition Width="170"/><ColumnDefinition Width="*"/><ColumnDefinition Width="110"/></Grid.ColumnDefinitions>
               <TextBlock Text="Night Light" VerticalAlignment="Center" />

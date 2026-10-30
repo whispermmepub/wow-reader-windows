@@ -13,6 +13,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Media.Animation;
+using System.Windows.Input;
 using System.Windows.Threading;
 using HtmlAgilityPack;
 using Microsoft.Win32;
@@ -25,6 +26,7 @@ namespace WowReader.Windows;
 public partial class MainWindow : Window
 {
     private const string ReaderHost = "wowreader.local";
+    private const string FixedWebViewRuntimeFolderName = "WebView2FixedRuntime";
     private readonly EpubBookService _epubService = new();
     private readonly LocalLibraryStore _library = new();
     private readonly ReadingProgressStore _progress = new();
@@ -44,13 +46,16 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _activityTimer = new() { Interval = TimeSpan.FromSeconds(30) };
     private readonly DispatcherTimer _eyeReminderTimer = new() { Interval = TimeSpan.FromMinutes(30) };
     private readonly DispatcherTimer _dailyReminderTimer = new() { Interval = TimeSpan.FromMinutes(1) };
+    private readonly DispatcherTimer _librarySearchTimer = new() { Interval = TimeSpan.FromMilliseconds(220) };
     private CoreWebView2Environment? _webEnvironment;
     private EpubBook? _book;
     private LibraryBookEntry? _pdfBook;
     private int _chapterIndex;
     private double _pendingScrollFraction;
+    private string _pendingNavigationFragment = "";
     private bool _documentLoaded;
     private bool _suppressPicker;
+    private bool _suppressChapterPicker;
     private bool _suppressFontPicker;
     private bool _isClosing;
     private bool _allowClose;
@@ -73,6 +78,14 @@ public partial class MainWindow : Window
     private DateOnly? _loadedCalendarMemoryDate;
     private string? _loadedCalendarMemoryBookId;
     private CancellationTokenSource? _exploreLoadCancellation;
+    private readonly SemaphoreSlim _positionSaveSemaphore = new(1, 1);
+    private readonly SemaphoreSlim _readerModeApplySemaphore = new(1, 1);
+    private long _positionSaveGeneration;
+    private long _lastProcessedPositionSaveGeneration;
+    private long _readerModeChangeGeneration;
+    private ReaderFullscreenState? _readerFullscreenState;
+    private bool _fullscreenTransitionInProgress;
+    private string _currentView = "";
 
     private const uint EsContinuous = 0x80000000;
     private const uint EsSystemRequired = 0x00000001;
@@ -88,6 +101,11 @@ public partial class MainWindow : Window
         _activityTimer.Tick += ActivityTimer_Tick;
         _eyeReminderTimer.Tick += EyeReminderTimer_Tick;
         _dailyReminderTimer.Tick += DailyReminderTimer_Tick;
+        _librarySearchTimer.Tick += (_, _) =>
+        {
+            _librarySearchTimer.Stop();
+            if (IsLoaded) RefreshLibraryItems();
+        };
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -97,25 +115,29 @@ public partial class MainWindow : Window
         try
         {
             AppPaths.EnsureCreated();
-            _webEnvironment = await CoreWebView2Environment.CreateAsync(userDataFolder: AppPaths.WebViewProfile);
+            _webEnvironment = await CreateWebViewEnvironmentAsync(FindBundledWebViewRuntime());
             await ReaderBrowser.EnsureCoreWebView2Async(_webEnvironment);
             if (_isClosing) return;
             ConfigureWebView();
 
-            _library.Load();
-            _progress.Load();
-            _activity.Load();
-            _bookmarks.Load();
-            _notes.Load();
-            _dayNotes.Load();
-            _dayMemories.Load();
-            _vocabulary.Load();
-            _completion.Load();
-            _fonts.Load();
-            _settingsStore.Load();
+            await Task.Run(() =>
+            {
+                _library.Load();
+                _progress.Load();
+                _activity.Load();
+                _bookmarks.Load();
+                _notes.Load();
+                _dayNotes.Load();
+                _dayMemories.Load();
+                _vocabulary.Load();
+                _completion.Load();
+                _fonts.Load();
+                _settingsStore.Load();
+                _bookSettingsStore.Load();
+            });
+            if (_isClosing) return;
             _globalSettings = _settingsStore.Current;
             _settings = _globalSettings.Clone();
-            _bookSettingsStore.Load();
             var today = DateOnly.FromDateTime(DateTime.Today);
             _displayedCalendarMonth = new DateOnly(today.Year, today.Month, 1);
             _selectedCalendarDate = today;
@@ -132,7 +154,6 @@ public partial class MainWindow : Window
             UpdateEyeReminderTimer();
             UpdateDailyReminderTimer();
             ShowView("Home");
-            RefreshScreenData();
             _lastActivitySampleUtc = DateTimeOffset.UtcNow;
             _saveTimer.Start();
             _activityTimer.Start();
@@ -149,8 +170,128 @@ public partial class MainWindow : Window
             if (!_isClosing) await DismissStartupSplashAsync();
             StatusText.Text = "WebView2 could not start";
             MessageBox.Show(this,
-                "The reader could not start its embedded browser. Install or update the Microsoft Edge WebView2 Evergreen Runtime, then try again.\n\n" + exception.Message,
+                "The reader could not start its embedded browser. Run the portable app from a writable local folder with its bundled WebView2 Fixed Version runtime, or install the Microsoft Edge WebView2 Evergreen Runtime. The Fixed Version runtime cannot run from a network/UNC path.\n\n" + exception.Message,
                 "WoW Reader for Windows", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private static string? FindBundledWebViewRuntime()
+    {
+        if (IsNetworkLocation(AppContext.BaseDirectory)) return null;
+        var runtimeFolder = Path.Combine(AppContext.BaseDirectory, FixedWebViewRuntimeFolderName);
+        return File.Exists(Path.Combine(runtimeFolder, "msedgewebview2.exe")) ? runtimeFolder : null;
+    }
+
+    private static bool IsNetworkLocation(string path)
+    {
+        if (path.StartsWith("\\\\", StringComparison.Ordinal) || path.StartsWith("//", StringComparison.Ordinal)) return true;
+        try
+        {
+            var root = Path.GetPathRoot(path);
+            return !string.IsNullOrEmpty(root) && new DriveInfo(root).DriveType == DriveType.Network;
+        }
+        catch (Exception exception) when (exception is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private async Task<CoreWebView2Environment> CreateWebViewEnvironmentAsync(string? browserExecutableFolder)
+    {
+        if (browserExecutableFolder is null)
+        {
+            return await CoreWebView2Environment.CreateAsync(userDataFolder: AppPaths.WebViewProfile);
+        }
+
+        try
+        {
+            await Task.Run(() => PrepareFixedRuntimePermissions(browserExecutableFolder));
+            return await CoreWebView2Environment.CreateAsync(
+                browserExecutableFolder: browserExecutableFolder,
+                userDataFolder: AppPaths.WebViewProfile);
+        }
+        catch (Exception fixedRuntimeException)
+        {
+            try
+            {
+                return await CoreWebView2Environment.CreateAsync(userDataFolder: AppPaths.WebViewProfile);
+            }
+            catch (Exception evergreenException)
+            {
+                throw new InvalidOperationException(
+                    $"The bundled Fixed Version runtime could not start ({fixedRuntimeException.Message}); the installed Evergreen fallback could not start either ({evergreenException.Message}).",
+                    evergreenException);
+            }
+        }
+    }
+
+    private static void PrepareFixedRuntimePermissions(string runtimeFolder)
+    {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0)
+            || OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+        {
+            return;
+        }
+
+        var executable = Path.Combine(runtimeFolder, "msedgewebview2.exe");
+        var runtimeVersion = FileVersionInfo.GetVersionInfo(executable).ProductVersion
+            ?? FileVersionInfo.GetVersionInfo(executable).FileVersion
+            ?? string.Empty;
+        var markerPath = Path.Combine(AppContext.BaseDirectory, ".wow-reader-webview2-acl-v1");
+        var markerContents = Path.GetFullPath(runtimeFolder) + "\n" + runtimeVersion;
+        try
+        {
+            if (File.Exists(markerPath)
+                && string.Equals(File.ReadAllText(markerPath), markerContents, StringComparison.Ordinal)) return;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+        }
+
+        GrantRuntimeReadAccess(runtimeFolder, "*S-1-15-2-2:(OI)(CI)(RX)");
+        GrantRuntimeReadAccess(runtimeFolder, "*S-1-15-2-1:(OI)(CI)(RX)");
+        try
+        {
+            File.WriteAllText(markerPath, markerContents, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // The permissions are applied; without a writable marker they will be checked again at next launch.
+        }
+    }
+
+    private static void GrantRuntimeReadAccess(string runtimeFolder, string accessRule)
+    {
+        var startInfo = new ProcessStartInfo("icacls.exe")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        startInfo.ArgumentList.Add(runtimeFolder);
+        startInfo.ArgumentList.Add("/grant");
+        startInfo.ArgumentList.Add(accessRule);
+        startInfo.ArgumentList.Add("/T");
+        startInfo.ArgumentList.Add("/C");
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException("Windows could not start icacls to prepare the bundled WebView2 runtime.");
+        var standardOutput = process.StandardOutput.ReadToEndAsync();
+        var standardError = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit(15000))
+        {
+            process.Kill(entireProcessTree: true);
+            throw new TimeoutException("Windows did not finish preparing the bundled WebView2 runtime permissions.");
+        }
+
+        if (process.ExitCode != 0)
+        {
+            var details = string.Join(Environment.NewLine,
+                new[] { standardError.GetAwaiter().GetResult(), standardOutput.GetAwaiter().GetResult() }
+                    .Where(value => !string.IsNullOrWhiteSpace(value)));
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(details)
+                ? "Windows could not grant read access to the bundled WebView2 runtime."
+                : details.Trim());
         }
     }
 
@@ -293,6 +434,12 @@ public partial class MainWindow : Window
         {
             await RestoreReaderPositionAsync(fraction);
         }
+        if (_pendingNavigationFragment.Length > 0)
+        {
+            var fragment = _pendingNavigationFragment;
+            _pendingNavigationFragment = "";
+            await RestoreReaderFragmentAsync(fragment);
+        }
         if (_pendingSearchTerm.Length > 0 && ReaderBrowser.CoreWebView2 is not null)
         {
             var term = JsonSerializer.Serialize(_pendingSearchTerm);
@@ -339,7 +486,6 @@ public partial class MainWindow : Window
                 _suppressPicker = false;
                 await SetBookAsync(book, _progress.Get(book.Id));
             }
-            RefreshScreenData();
             ShowView("Reader");
         }
         catch (Exception exception)
@@ -435,17 +581,16 @@ public partial class MainWindow : Window
 
     private void LibrarySearchBox_TextChanged(object sender, TextChangedEventArgs e)
     {
-        if (IsLoaded)
-        {
-            RefreshScreenData();
-        }
+        if (!IsLoaded) return;
+        _librarySearchTimer.Stop();
+        _librarySearchTimer.Start();
     }
 
     private void LibrarySortPicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (IsLoaded)
         {
-            RefreshScreenData();
+            RefreshLibraryItems();
         }
     }
 
@@ -453,7 +598,7 @@ public partial class MainWindow : Window
     {
         if (IsLoaded)
         {
-            RefreshScreenData();
+            RefreshLibraryItems();
         }
     }
 
@@ -475,80 +620,261 @@ public partial class MainWindow : Window
 
     private async void ReadingModePicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_suppressSettingsPicker || ReadingModePicker.SelectedValue is not string mode || !IsLoaded || _isClosing
-            || mode == _settings.ReadingMode)
+        if (_suppressSettingsPicker || ReadingModePicker.SelectedValue is not string mode || !IsLoaded || _isClosing)
+        {
+            return;
+        }
+        var requestGeneration = Interlocked.Increment(ref _readerModeChangeGeneration);
+        if (mode == _settings.ReadingMode)
+        {
+            QueueReaderFocus();
+            return;
+        }
+
+        if (!ReadingModePicker.IsDropDownOpen)
+        {
+            QueueReaderFocus();
+        }
+        await SaveCurrentPositionAsync(waitForPersistence: false);
+        if (!IsCurrentReaderModeRequest(requestGeneration, mode)) return;
+
+        await _readerModeApplySemaphore.WaitAsync();
+        try
+        {
+            if (!IsCurrentReaderModeRequest(requestGeneration, mode)) return;
+            var fraction = _book is null ? 0d : _progress.Get(_book.Id).ScrollFraction;
+            _settings.ReadingMode = mode;
+            _settings.Normalize();
+            SaveActiveSettings();
+            await ApplyReaderSettingsAsync();
+            if (!IsCurrentReaderModeRequest(requestGeneration, mode)) return;
+            await RestoreReaderPositionAsync(fraction);
+            if (!IsCurrentReaderModeRequest(requestGeneration, mode)) return;
+            UpdateReaderLabels(fraction);
+        }
+        finally
+        {
+            _readerModeApplySemaphore.Release();
+        }
+        QueueReaderFocus();
+    }
+
+    private bool IsCurrentReaderModeRequest(long generation, string mode) =>
+        generation == Volatile.Read(ref _readerModeChangeGeneration)
+        && ReadingModePicker.SelectedValue as string == mode
+        && !_isClosing;
+
+    private void ReadingModePicker_DropDownClosed(object sender, EventArgs e)
+    {
+        QueueReaderFocus();
+    }
+
+    private void QueueReaderFocus()
+    {
+        if (_book is null || !_documentLoaded || ReaderView.Visibility != Visibility.Visible || _isClosing)
         {
             return;
         }
 
-        await SaveCurrentPositionAsync();
-        var fraction = _book is null ? 0d : _progress.Get(_book.Id).ScrollFraction;
-        _settings.ReadingMode = mode;
-        _settings.Normalize();
-        SaveActiveSettings();
-        await ApplyReaderSettingsAsync();
-        await RestoreReaderPositionAsync(fraction);
-        UpdateReaderLabels(fraction);
+        Dispatcher.BeginInvoke(DispatcherPriority.Input, new Action(() =>
+        {
+            if (!_isClosing && _book is not null && _documentLoaded && ReaderView.Visibility == Visibility.Visible)
+            {
+                ReaderBrowser.Focus();
+                Keyboard.Focus(ReaderBrowser);
+            }
+        }));
     }
 
     private async void ReaderSettingsButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_pdfBook is not null)
+        try
         {
-            MessageBox.Show(this, "Reader typography settings apply to EPUB content. Use the PDF toolbar for PDF zoom and layout.", "PDF settings", MessageBoxButton.OK, MessageBoxImage.Information);
+            if (_pdfBook is not null)
+            {
+                MessageBox.Show(this, "Reader typography settings apply to EPUB content. Use the PDF toolbar for PDF zoom and layout.", "PDF settings", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            await SaveCurrentPositionAsync();
+            var dialog = new ReaderSettingsWindow(_settings, _book is not null, _book is not null && _bookSettingsStore.HasOverride(_book.Id)) { Owner = this };
+            if (dialog.ShowDialog() != true)
+            {
+                return;
+            }
+
+            var fraction = _book is null ? 0d : _progress.Get(_book.Id).ScrollFraction;
+            var edited = dialog.Settings;
+            edited.Normalize();
+            if (dialog.UseBookTypography && _book is not null)
+            {
+                _bookSettingsStore.Set(_book.Id, ReaderBookSettings.From(edited));
+                var global = edited.Clone();
+                CopyTypography(_globalSettings, global);
+                _globalSettings = global;
+                _settingsStore.Save(_globalSettings);
+                _settings = _globalSettings.Clone();
+                _bookSettingsStore.Get(_book.Id)?.ApplyTo(_settings);
+            }
+            else
+            {
+                if (_book is not null && _bookSettingsStore.HasOverride(_book.Id))
+                {
+                    if (TypographyEquals(edited, _settings)) CopyTypography(_globalSettings, edited);
+                    _bookSettingsStore.Remove(_book.Id);
+                }
+                _globalSettings = edited.Clone();
+                _settings = _globalSettings.Clone();
+                _settingsStore.Save(_globalSettings);
+            }
+            if (dialog.ResetRequested)
+            {
+                _fonts.Select(null);
+                _suppressFontPicker = true;
+                RefreshFontPicker(null);
+                _suppressFontPicker = false;
+            }
+            _suppressSettingsPicker = true;
+            RefreshSettingsPicker();
+            _suppressSettingsPicker = false;
+            ApplyKeepScreenAwake(_settings.KeepScreenOn);
+            UpdateEyeReminderTimer();
+            UpdateDailyReminderTimer();
+            if (_book is not null && _documentLoaded)
+            {
+                await ApplySelectedFontAsync();
+                await ApplyReaderSettingsAsync();
+                await RestoreReaderPositionAsync(fraction);
+            }
+            UpdateReaderLabels(fraction);
+        }
+        catch (Exception exception)
+        {
+            StatusText.Text = "Reader settings could not be opened or saved";
+            MessageBox.Show(this, $"Reader settings were not fully applied. Your book and reading position are unchanged.\n\n{exception.Message}",
+                "Reader settings", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private async void FullscreenButton_Click(object sender, RoutedEventArgs e)
+    {
+        await ToggleReaderFullscreenAsync();
+    }
+
+    private async void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.F5 && CanToggleReaderFullscreen())
+        {
+            e.Handled = true;
+            await ToggleReaderFullscreenAsync();
             return;
         }
-        await SaveCurrentPositionAsync();
-        var dialog = new ReaderSettingsWindow(_settings, _book is not null, _book is not null && _bookSettingsStore.HasOverride(_book.Id)) { Owner = this };
-        if (dialog.ShowDialog() != true)
+        if (e.Key == Key.Escape && _readerFullscreenState is not null)
         {
+            e.Handled = true;
+            await ToggleReaderFullscreenAsync();
             return;
         }
 
-        var fraction = _book is null ? 0d : _progress.Get(_book.Id).ScrollFraction;
-        var edited = dialog.Settings;
-        edited.Normalize();
-        if (dialog.UseBookTypography && _book is not null)
+        var direction = e.Key switch
         {
-            _bookSettingsStore.Set(_book.Id, ReaderBookSettings.From(edited));
-            var global = edited.Clone();
-            CopyTypography(_globalSettings, global);
-            _globalSettings = global;
-            _settingsStore.Save(_globalSettings);
-            _settings = _globalSettings.Clone();
-            _bookSettingsStore.Get(_book.Id)?.ApplyTo(_settings);
-        }
-        else
+            Key.Left or Key.Up or Key.PageUp => -1,
+            Key.Right or Key.Down or Key.PageDown => 1,
+            _ => 0
+        };
+        if (direction != 0 && Keyboard.Modifiers == ModifierKeys.None
+            && ReadingModePicker.IsKeyboardFocusWithin && !ReadingModePicker.IsDropDownOpen
+            && _book is not null && _documentLoaded && ReaderBrowser.CoreWebView2 is { } core)
         {
-            if (_book is not null && _bookSettingsStore.HasOverride(_book.Id))
+            e.Handled = true;
+            try
             {
-                if (TypographyEquals(edited, _settings)) CopyTypography(_globalSettings, edited);
-                _bookSettingsStore.Remove(_book.Id);
+                await core.ExecuteScriptAsync($"if(window.wowReaderNavigate)window.wowReaderNavigate({direction});");
             }
-            _globalSettings = edited.Clone();
-            _settings = _globalSettings.Clone();
-            _settingsStore.Save(_globalSettings);
+            catch (Exception exception) when (exception is InvalidOperationException or COMException)
+            {
+                StatusText.Text = "Reader navigation could not be completed";
+            }
+            QueueReaderFocus();
         }
-        if (dialog.ResetRequested)
+    }
+
+    private bool CanToggleReaderFullscreen() => !_isClosing
+        && ReaderView.Visibility == Visibility.Visible
+        && (_book is not null || _pdfBook is not null);
+
+    private async Task ToggleReaderFullscreenAsync()
+    {
+        if (!CanToggleReaderFullscreen() || _fullscreenTransitionInProgress) return;
+        _fullscreenTransitionInProgress = true;
+        try
         {
-            _fonts.Select(null);
-            _suppressFontPicker = true;
-            RefreshFontPicker(null);
-            _suppressFontPicker = false;
+            double? savedFraction = null;
+            if (_book is not null && _documentLoaded)
+            {
+                await SaveCurrentPositionAsync();
+                savedFraction = _progress.Get(_book.Id).ScrollFraction;
+            }
+
+            if (_readerFullscreenState is null) EnterReaderFullscreen();
+            else ExitReaderFullscreen();
+
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render);
+            if (_book is not null && _documentLoaded && savedFraction.HasValue)
+            {
+                await RestoreReaderPositionAsync(savedFraction.Value);
+            }
         }
-        _suppressSettingsPicker = true;
-        RefreshSettingsPicker();
-        _suppressSettingsPicker = false;
-        ApplyKeepScreenAwake(_settings.KeepScreenOn);
-        UpdateEyeReminderTimer();
-        UpdateDailyReminderTimer();
-        if (_book is not null && _documentLoaded)
+        catch (Exception exception) when (exception is InvalidOperationException or COMException or IOException or UnauthorizedAccessException)
         {
-            await ApplySelectedFontAsync();
-            await ApplyReaderSettingsAsync();
-            await RestoreReaderPositionAsync(fraction);
+            StatusText.Text = "Fullscreen mode could not be changed";
         }
-        UpdateReaderLabels(fraction);
+        finally
+        {
+            _fullscreenTransitionInProgress = false;
+            UpdateReaderLabels();
+        }
+    }
+
+    private void EnterReaderFullscreen()
+    {
+        _readerFullscreenState = new ReaderFullscreenState(
+            WindowStyle, ResizeMode, WindowState, RestoreBounds,
+            AppHeader.Visibility, AppFooter.Visibility, ReaderToolbar.Visibility,
+            ReaderPageSurface.Margin, ReaderPageSurface.BorderThickness, ReaderPageSurface.CornerRadius);
+        AppHeader.Visibility = Visibility.Collapsed;
+        AppFooter.Visibility = Visibility.Collapsed;
+        ReaderToolbar.Visibility = Visibility.Collapsed;
+        ReaderPageSurface.Margin = new Thickness(0);
+        ReaderPageSurface.BorderThickness = new Thickness(0);
+        ReaderPageSurface.CornerRadius = new CornerRadius(0);
+        WindowStyle = WindowStyle.None;
+        ResizeMode = ResizeMode.NoResize;
+        WindowState = WindowState.Maximized;
+        FullscreenButton.Content = "Exit full screen";
+    }
+
+    private void ExitReaderFullscreen()
+    {
+        if (_readerFullscreenState is not { } previous) return;
+        WindowState = WindowState.Normal;
+        WindowStyle = previous.WindowStyle;
+        ResizeMode = previous.ResizeMode;
+        if (previous.WindowState == WindowState.Normal && !previous.RestoreBounds.IsEmpty)
+        {
+            Left = previous.RestoreBounds.Left;
+            Top = previous.RestoreBounds.Top;
+            Width = previous.RestoreBounds.Width;
+            Height = previous.RestoreBounds.Height;
+        }
+        AppHeader.Visibility = previous.AppHeaderVisibility;
+        AppFooter.Visibility = previous.AppFooterVisibility;
+        ReaderToolbar.Visibility = previous.ReaderToolbarVisibility;
+        ReaderPageSurface.Margin = previous.ReaderPageSurfaceMargin;
+        ReaderPageSurface.BorderThickness = previous.ReaderPageSurfaceBorderThickness;
+        ReaderPageSurface.CornerRadius = previous.ReaderPageSurfaceCornerRadius;
+        WindowState = previous.WindowState;
+        _readerFullscreenState = null;
+        FullscreenButton.Content = "Full screen";
     }
 
     private void SaveActiveSettings()
@@ -633,7 +959,9 @@ public partial class MainWindow : Window
         _pdfBook = entry;
         _chapterIndex = 0;
         _pendingScrollFraction = 0;
+        _pendingNavigationFragment = "";
         _documentLoaded = false;
+        RefreshChapterPicker();
         _library.SetLastOpened(entry.Id);
         _suppressPicker = true;
         RefreshLibraryPicker(entry.Id);
@@ -663,8 +991,10 @@ public partial class MainWindow : Window
         _suppressSettingsPicker = false;
         _chapterIndex = Math.Clamp(position.ChapterIndex, 0, book.Chapters.Count - 1);
         _pendingScrollFraction = Math.Clamp(position.ScrollFraction, 0d, 1d);
+        _pendingNavigationFragment = "";
         _pagePositionLabel = "";
         _documentLoaded = false;
+        RefreshChapterPicker();
 
         var core = ReaderBrowser.CoreWebView2 ?? throw new InvalidOperationException("WebView2 is not ready.");
         if (!string.Equals(_mappedBookId, book.Id, StringComparison.Ordinal))
@@ -681,6 +1011,48 @@ public partial class MainWindow : Window
         UpdateReaderLabels();
         StatusText.Text = "Reading locally — no account or sync";
         return Task.CompletedTask;
+    }
+
+    private void RefreshChapterPicker()
+    {
+        _suppressChapterPicker = true;
+        try
+        {
+            ChapterPicker.ItemsSource = _book?.Chapters
+                .Select((chapter, index) => new ChapterPickerItem(index, $"{index + 1}. {chapter.Title}"))
+                .ToArray();
+            ChapterPicker.SelectedValue = _book is null ? null : _chapterIndex;
+            ChapterPicker.IsEnabled = _documentLoaded && _book is not null && _book.Chapters.Count > 0;
+        }
+        finally
+        {
+            _suppressChapterPicker = false;
+        }
+    }
+
+    private void UpdateChapterPickerSelection()
+    {
+        _suppressChapterPicker = true;
+        ChapterPicker.SelectedValue = _book is null ? null : _chapterIndex;
+        ChapterPicker.IsEnabled = _documentLoaded && _book is not null && _book.Chapters.Count > 0;
+        _suppressChapterPicker = false;
+    }
+
+    private async void ChapterPicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressChapterPicker || _book is null || !IsLoaded || _isClosing
+            || ChapterPicker.SelectedValue is not int selectedIndex
+            || selectedIndex < 0 || selectedIndex >= _book.Chapters.Count || selectedIndex == _chapterIndex)
+        {
+            return;
+        }
+
+        await SaveCurrentPositionAsync();
+        _chapterIndex = selectedIndex;
+        _pendingScrollFraction = 0d;
+        _pendingNavigationFragment = "";
+        _pendingSearchTerm = "";
+        NavigateToCurrentChapter();
     }
 
     private async void PreviousButton_Click(object sender, RoutedEventArgs e)
@@ -725,7 +1097,8 @@ public partial class MainWindow : Window
         }
         await SaveCurrentPositionAsync();
         _chapterIndex = nextIndex;
-        _pendingScrollFraction = direction < 0 && _settings.ReadingMode == "page" ? 1d : 0d;
+        _pendingScrollFraction = direction < 0 ? 1d : 0d;
+        _pendingNavigationFragment = "";
         NavigateToCurrentChapter();
     }
 
@@ -736,7 +1109,9 @@ public partial class MainWindow : Window
             return;
         }
         _chapterIndex = Math.Clamp(_chapterIndex, 0, _book.Chapters.Count - 1);
+        UpdateChapterPickerSelection();
         _documentLoaded = false;
+        ChapterPicker.IsEnabled = false;
         _pagePositionLabel = "";
         var chapter = _book.Chapters[_chapterIndex];
         var relative = Path.GetRelativePath(_book.ExtractedRoot, chapter.LocalPath)
@@ -748,34 +1123,84 @@ public partial class MainWindow : Window
         UpdateReaderLabels();
     }
 
-    private async Task SaveCurrentPositionAsync()
+    private async Task SaveCurrentPositionAsync(bool waitForPersistence = true)
     {
-        if (_book is null || !_documentLoaded || ReaderBrowser.CoreWebView2 is null)
+        var generation = Interlocked.Increment(ref _positionSaveGeneration);
+        while (true)
         {
-            return;
+            await SavePositionRequestAsync(generation, waitForPersistence);
+            var latestGeneration = Volatile.Read(ref _positionSaveGeneration);
+            if (generation == latestGeneration) return;
+            generation = latestGeneration;
         }
+    }
+
+    private async Task SavePositionRequestAsync(long generation, bool waitForPersistence)
+    {
+        await _positionSaveSemaphore.WaitAsync();
         try
         {
-            var result = await ReaderBrowser.CoreWebView2.ExecuteScriptAsync(
-                "(function(){if(window.wowReaderGetProgress)return window.wowReaderGetProgress();const d=document.documentElement;const m=Math.max(0,d.scrollHeight-window.innerHeight);return m===0?0:Math.max(0,Math.min(1,window.scrollY/m));})()")
-                .ConfigureAwait(true);
-            var fraction = JsonSerializer.Deserialize<double>(result);
-            if (!double.IsFinite(fraction))
+            if (generation != Volatile.Read(ref _positionSaveGeneration)
+                || generation <= _lastProcessedPositionSaveGeneration)
             {
-                fraction = 0d;
+                return;
             }
-            if (_settings.ReadingMode == "page")
+            if (_book is null || !_documentLoaded || ReaderBrowser.CoreWebView2 is null)
             {
-                var pageLabelJson = await ReaderBrowser.CoreWebView2.ExecuteScriptAsync(
-                    "window.wowReaderGetPageLabel?window.wowReaderGetPageLabel():'Page mode'");
-                _pagePositionLabel = JsonSerializer.Deserialize<string>(pageLabelJson) ?? "Page mode";
+                _lastProcessedPositionSaveGeneration = generation;
+                return;
             }
-            _progress.Save(_book.Id, _chapterIndex, Math.Clamp(fraction, 0d, 1d));
-            UpdateReaderLabels(fraction);
+
+            var book = _book;
+            var chapterIndex = _chapterIndex;
+            var readingMode = _settings.ReadingMode;
+            var core = ReaderBrowser.CoreWebView2;
+            await SaveCurrentPositionCoreAsync(book, chapterIndex, readingMode, core, waitForPersistence);
+            _lastProcessedPositionSaveGeneration = generation;
         }
-        catch (Exception exception) when (exception is InvalidOperationException or JsonException or IOException or UnauthorizedAccessException)
+        finally
         {
-            StatusText.Text = "Reading — position save will retry";
+            _positionSaveSemaphore.Release();
+        }
+    }
+
+    private async Task SaveCurrentPositionCoreAsync(EpubBook book, int chapterIndex, string readingMode, CoreWebView2 core, bool waitForPersistence)
+    {
+        try
+        {
+            const string script = "(()=>{const d=document.documentElement;const fraction=window.wowReaderGetProgress?window.wowReaderGetProgress():(()=>{const m=Math.max(0,d.scrollHeight-window.innerHeight);return m===0?0:Math.max(0,Math.min(1,window.scrollY/m));})();const pageLabel=window.wowReaderGetPageLabel?window.wowReaderGetPageLabel():'Page mode';return {Fraction:fraction,PageLabel:pageLabel};})()";
+            var result = await core.ExecuteScriptAsync(script);
+            var snapshot = JsonSerializer.Deserialize<ReaderPositionSnapshot>(result);
+            var fraction = snapshot?.Fraction ?? 0d;
+            if (!double.IsFinite(fraction)) fraction = 0d;
+            if (readingMode == "page") _pagePositionLabel = snapshot?.PageLabel ?? "Page mode";
+            fraction = Math.Clamp(fraction, 0d, 1d);
+            var persistence = _progress.SaveAsync(book.Id, chapterIndex, fraction);
+            if (waitForPersistence) await persistence;
+            else _ = ObservePositionPersistenceAsync(persistence);
+            if (_book?.Id == book.Id && _chapterIndex == chapterIndex) UpdateReaderLabels(fraction);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or JsonException or IOException or UnauthorizedAccessException or COMException)
+        {
+            if (_book?.Id == book.Id && _chapterIndex == chapterIndex) StatusText.Text = "Reading — position save will retry";
+        }
+    }
+
+    private async Task ObservePositionPersistenceAsync(Task persistence)
+    {
+        try
+        {
+            await persistence.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            if (!Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished)
+            {
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (!_isClosing) StatusText.Text = "Reading — position save will retry";
+                }));
+            }
         }
     }
 
@@ -796,18 +1221,20 @@ public partial class MainWindow : Window
             return;
         }
         _exitDialogOpen = true;
-        ActivityTimer_Tick(null, EventArgs.Empty);
+        await SampleActivityAsync();
         var shouldExit = ShowExitConfirmationDialog();
         _exitDialogOpen = false;
         if (!shouldExit) return;
         _isClosing = true;
         _saveTimer.Stop();
         _activityTimer.Stop();
+        _librarySearchTimer.Stop();
         _eyeReminderTimer.Stop();
         _dailyReminderTimer.Stop();
         SaveCalendarDayNoteIfNeeded();
         SaveCalendarDayMemoryIfNeeded();
         await SaveCurrentPositionAsync();
+        await _activity.SaveAsync();
         ApplyKeepScreenAwake(false);
         _allowClose = true;
         Close();
@@ -943,6 +1370,9 @@ public partial class MainWindow : Window
 
     private void ShowView(string view)
     {
+        var viewChanged = !string.Equals(_currentView, view, StringComparison.Ordinal);
+        _currentView = view;
+        if (view != "Reader" && _readerFullscreenState is not null) ExitReaderFullscreen();
         HomeView.Visibility = view == "Home" ? Visibility.Visible : Visibility.Collapsed;
         LibraryView.Visibility = view == "Library" ? Visibility.Visible : Visibility.Collapsed;
         ExploreView.Visibility = view == "Explore" ? Visibility.Visible : Visibility.Collapsed;
@@ -970,8 +1400,8 @@ public partial class MainWindow : Window
             ReaderBrowser.Visibility = Visibility.Collapsed;
             EmptyState.Visibility = Visibility.Visible;
         }
-        if (view == "Explore") _ = LoadExploreFeedAsync();
-        RefreshScreenData();
+        if (view == "Explore" && viewChanged) _ = LoadExploreFeedAsync();
+        if (viewChanged) RefreshScreenData();
     }
 
     private async void HomeContinueButton_Click(object sender, RoutedEventArgs e)
@@ -1129,7 +1559,7 @@ public partial class MainWindow : Window
 
     private void LibraryShelfPicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (IsLoaded) RefreshScreenData();
+        if (IsLoaded) RefreshLibraryItems();
     }
 
     private async void RefreshExploreButton_Click(object sender, RoutedEventArgs e) => await LoadExploreFeedAsync();
@@ -1183,27 +1613,39 @@ public partial class MainWindow : Window
 
         var dialog = new Window
         {
-            Title = $"Contents · {_book.Title}", Owner = this, Width = 520, Height = 600,
+            Title = $"Contents · {_book.Title}", Owner = this, Width = 560, Height = 640,
             WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = Brushes.White
         };
-        var list = new ListBox { Margin = new Thickness(12), DisplayMemberPath = nameof(TocItem.Title) };
-        list.ItemsSource = _book.Chapters.Select((chapter, index) => new TocItem(index, chapter.Title)).ToArray();
-        list.SelectedIndex = _chapterIndex;
-        list.MouseDoubleClick += async (_, _) =>
-        {
-            if (list.SelectedItem is TocItem item)
-            {
-                await SaveCurrentPositionAsync();
-                _chapterIndex = item.Index;
-                _pendingScrollFraction = 0d;
-                _pendingSearchTerm = "";
-                NavigateToCurrentChapter();
-                dialog.Close();
-            }
-        };
-        dialog.Content = new DockPanel { Children = { new TextBlock { Text = "Double-click a chapter to open it.", Foreground = Brushes.DimGray, Margin = new Thickness(14, 12, 14, 0) }, list } };
-        DockPanel.SetDock(dialog.Content is DockPanel content ? content.Children[0] : null, Dock.Top);
+        var items = _book.Contents.Select(item => new TocItem(item.Title, item.ChapterIndex, item.Fragment, item.Depth)).ToArray();
+        var list = new ListBox { Margin = new Thickness(12), DisplayMemberPath = nameof(TocItem.DisplayTitle) };
+        list.ItemsSource = items;
+        list.SelectedIndex = Array.FindIndex(items, item => item.ChapterIndex == _chapterIndex);
+        if (list.SelectedIndex < 0 && items.Length > 0) list.SelectedIndex = 0;
+        var openButton = new Button { Content = "Open selected section", Padding = new Thickness(14, 8, 14, 8), MinWidth = 150, IsDefault = true };
+        openButton.IsEnabled = list.SelectedItem is TocItem;
+        openButton.Click += async (_, _) => await OpenSelectedAsync();
+        list.MouseDoubleClick += async (_, _) => await OpenSelectedAsync();
+        var root = new DockPanel { Margin = new Thickness(8) };
+        var instruction = new TextBlock { Text = "Choose a section from this book’s contents.", Foreground = Brushes.DimGray, Margin = new Thickness(12, 10, 12, 0) };
+        DockPanel.SetDock(instruction, Dock.Top);
+        DockPanel.SetDock(openButton, Dock.Bottom);
+        root.Children.Add(instruction);
+        root.Children.Add(openButton);
+        root.Children.Add(list);
+        dialog.Content = root;
         dialog.ShowDialog();
+
+        async Task OpenSelectedAsync()
+        {
+            if (list.SelectedItem is not TocItem item || _book is null) return;
+            await SaveCurrentPositionAsync();
+            _chapterIndex = item.ChapterIndex;
+            _pendingScrollFraction = 0d;
+            _pendingNavigationFragment = item.Fragment;
+            _pendingSearchTerm = "";
+            NavigateToCurrentChapter();
+            dialog.Close();
+        }
     }
 
     private async void SearchButton_Click(object sender, RoutedEventArgs e)
@@ -1234,7 +1676,10 @@ public partial class MainWindow : Window
         root.Children.Add(searchRow);
         root.Children.Add(results);
 
-        void RunSearch()
+        CancellationTokenSource? searchCancellation = null;
+        var searchGeneration = 0;
+
+        async Task RunSearchAsync()
         {
             var term = searchBox.Text.Trim();
             if (term.Length == 0)
@@ -1243,19 +1688,62 @@ public partial class MainWindow : Window
                 message.Text = "Enter a word or phrase to search.";
                 return;
             }
+            if (_book is not { } book)
+            {
+                message.Text = "Open an EPUB before searching its text.";
+                return;
+            }
+
+            var generation = ++searchGeneration;
+            var cancellation = new CancellationTokenSource();
+            searchCancellation?.Cancel();
+            searchCancellation = cancellation;
+            findButton.IsEnabled = false;
+            message.Text = "Searching this EPUB on this PC…";
             try
             {
-                var matches = FindInBook(term);
+                var matches = await Task.Run(() => FindInBook(book, term, cancellation.Token), cancellation.Token);
+                if (generation != searchGeneration || !dialog.IsVisible || !ReferenceEquals(_book, book)) return;
                 results.ItemsSource = matches;
                 message.Text = matches.Count == 0 ? "No matches found in this EPUB." : $"{matches.Count} match(es). Double-click a result to jump to it.";
+            }
+            catch (OperationCanceledException)
+            {
+                // A newer query or dialog close superseded this search.
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
                 message.Text = "The local EPUB text could not be searched.";
             }
+            finally
+            {
+                if (generation == searchGeneration) findButton.IsEnabled = true;
+                cancellation.Dispose();
+            }
         }
 
-        findButton.Click += (_, _) => RunSearch();
+        findButton.Click += async (_, _) => await RunSearchAsync();
+        searchBox.PreviewKeyDown += async (_, args) =>
+        {
+            if (args.Key != Key.Enter) return;
+            args.Handled = true;
+            await RunSearchAsync();
+        };
+        searchBox.TextChanged += (_, _) =>
+        {
+            if (searchCancellation is null) return;
+            searchGeneration++;
+            searchCancellation.Cancel();
+            searchCancellation = null;
+            findButton.IsEnabled = searchBox.Text.Trim().Length > 0;
+            message.Text = "Search changed. Press Find to run the updated query.";
+        };
+        dialog.Closed += (_, _) =>
+        {
+            searchGeneration++;
+            searchCancellation?.Cancel();
+            searchCancellation = null;
+        };
         results.MouseDoubleClick += async (_, _) =>
         {
             if (results.SelectedItem is SearchResultItem item && _book is not null)
@@ -1273,18 +1761,14 @@ public partial class MainWindow : Window
         dialog.ShowDialog();
     }
 
-    private List<SearchResultItem> FindInBook(string term)
+    private List<SearchResultItem> FindInBook(EpubBook book, string term, CancellationToken cancellationToken)
     {
         var results = new List<SearchResultItem>();
-        if (_book is null)
-        {
-            return results;
-        }
-
         var boundedTerm = term.Length > 160 ? term[..160] : term;
-        for (var chapterIndex = 0; chapterIndex < _book.Chapters.Count && results.Count < 350; chapterIndex++)
+        for (var chapterIndex = 0; chapterIndex < book.Chapters.Count && results.Count < 350; chapterIndex++)
         {
-            var chapter = _book.Chapters[chapterIndex];
+            cancellationToken.ThrowIfCancellationRequested();
+            var chapter = book.Chapters[chapterIndex];
             var document = new HtmlDocument();
             document.Load(chapter.LocalPath);
             var text = HtmlEntity.DeEntitize(document.DocumentNode.InnerText)
@@ -1293,6 +1777,7 @@ public partial class MainWindow : Window
             var offset = 0;
             while (offset < text.Length && results.Count < 350)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var match = text.IndexOf(boundedTerm, offset, StringComparison.CurrentCultureIgnoreCase);
                 if (match < 0)
                 {
@@ -1380,7 +1865,11 @@ public partial class MainWindow : Window
         dialog.ShowDialog();
     }
 
-    private sealed record TocItem(int Index, string Title);
+    private sealed record TocItem(string Title, int ChapterIndex, string Fragment, int Depth)
+    {
+        public string DisplayTitle => string.Concat(Enumerable.Repeat("\u2003", Math.Clamp(Depth, 0, 8)))
+            + (Depth > 0 ? "› " : "") + Title;
+    }
     private sealed record SearchResultItem(int ChapterIndex, double Fraction, string Term, string Display);
     private sealed record BookmarkListItem(ReaderBookmark Bookmark, string Details);
 
@@ -1442,7 +1931,7 @@ public partial class MainWindow : Window
                 var chapter = _book.Chapters[Math.Clamp(_chapterIndex, 0, _book.Chapters.Count - 1)];
                 var color = highlight.IsChecked == true ? colors.SelectedValue as string ?? "yellow" : "none";
                 var saved = _notes.Add(_book.Id, _chapterIndex, position.ScrollFraction, chapter.Title, quote, noteInput.Text, color);
-                if (saved.HighlightColor != "none") await ApplyReaderAnnotationsAsync();
+                if (saved.HighlightColor != "none") await ApplyReaderAnnotationAsync(saved);
                 StatusText.Text = "Note saved on this PC";
                 dialog.Close();
             }
@@ -1557,23 +2046,50 @@ public partial class MainWindow : Window
         var annotations = _notes.ForBook(_book.Id)
             .Where(note => note.ChapterIndex == _chapterIndex && note.Quote.Length > 0 && note.HighlightColor != "none")
             .Take(100)
-            .ToArray();
-        var clearMarks = "document.querySelectorAll('mark[data-wow-reader-note]').forEach(m=>{const f=document.createDocumentFragment();while(m.firstChild)f.appendChild(m.firstChild);m.replaceWith(f);});";
-        await ReaderBrowser.CoreWebView2.ExecuteScriptAsync(clearMarks);
-        foreach (var annotation in annotations)
-        {
-            var quote = JsonSerializer.Serialize(annotation.Quote);
-            var color = JsonSerializer.Serialize(annotation.HighlightColor switch
+            .Select(note => new
             {
-                "teal" => "#A9DCC8",
-                "pink" => "#F4B8C4",
-                "purple" => "#D5C2EF",
-                _ => "#FFE082"
-            });
-            var script = $"(()=>{{const t={quote},c={color};if(!t||!window.find)return;const s=window.getSelection();if(window.find(t,false,false,true,false,true,false)&&s&&s.rangeCount){{const r=s.getRangeAt(0);const m=document.createElement('mark');m.dataset.wowReaderNote='1';m.style.cssText='background:'+c+';color:inherit;border-radius:2px;padding:0 1px;';m.appendChild(r.extractContents());r.insertNode(m);s.removeAllRanges();}}}})();";
+                quote = note.Quote,
+                color = HighlightColorCss(note.HighlightColor)
+            })
+            .ToArray();
+        var annotationsJson = JsonSerializer.Serialize(annotations);
+        var script = "(()=>{const notes=" + annotationsJson + ";document.querySelectorAll('mark[data-wow-reader-note]').forEach(m=>{const f=document.createDocumentFragment();while(m.firstChild)f.appendChild(m.firstChild);m.replaceWith(f);});let i=0;const applyBatch=()=>{const end=Math.min(i+6,notes.length);for(;i<end;i++){const {quote,color}=notes[i];if(!quote||!window.find)continue;if(!window.find(quote,false,false,true,false,true,false))continue;const selection=window.getSelection();if(!selection||!selection.rangeCount)continue;const range=selection.getRangeAt(0);const mark=document.createElement('mark');mark.dataset.wowReaderNote='1';mark.style.cssText='background:'+color+';color:inherit;border-radius:2px;padding:0 1px;';mark.appendChild(range.extractContents());range.insertNode(mark);selection.removeAllRanges();}if(i<notes.length){if(window.requestIdleCallback)window.requestIdleCallback(applyBatch,{timeout:60});else window.setTimeout(applyBatch,0);}};window.setTimeout(applyBatch,0);})();";
+        try
+        {
             await ReaderBrowser.CoreWebView2.ExecuteScriptAsync(script);
         }
+        catch (Exception exception) when (exception is InvalidOperationException or COMException)
+        {
+            StatusText.Text = "Some saved highlights could not be displayed";
+        }
     }
+
+    private async Task ApplyReaderAnnotationAsync(ReaderNote annotation)
+    {
+        if (_book is null || !_documentLoaded || ReaderBrowser.CoreWebView2 is null
+            || annotation.Quote.Length == 0 || annotation.HighlightColor == "none") return;
+        var quote = JsonSerializer.Serialize(annotation.Quote);
+        var color = JsonSerializer.Serialize(HighlightColorCss(annotation.HighlightColor));
+        var script = "(()=>{const quote=" + quote + ",color=" + color + ";if(!window.find||!window.find(quote,false,false,true,false,true,false))return;const selection=window.getSelection();if(!selection||!selection.rangeCount)return;const range=selection.getRangeAt(0);const mark=document.createElement('mark');mark.dataset.wowReaderNote='1';mark.style.cssText='background:'+color+';color:inherit;border-radius:2px;padding:0 1px;';mark.appendChild(range.extractContents());range.insertNode(mark);selection.removeAllRanges();})();";
+        try
+        {
+            await ReaderBrowser.CoreWebView2.ExecuteScriptAsync(script);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or COMException)
+        {
+            StatusText.Text = "Note saved, but its highlight could not be displayed";
+        }
+    }
+
+    private static string HighlightColorCss(string color) => color switch
+    {
+        "teal" => "#A9DCC8",
+        "pink" => "#F4B8C4",
+        "purple" => "#D5C2EF",
+        _ => "#FFE082"
+    };
+
+    private sealed record ReaderPositionSnapshot(double Fraction, string? PageLabel);
 
     private sealed record NoteListItem(ReaderNote Note, string Display);
 
@@ -1778,7 +2294,12 @@ public partial class MainWindow : Window
         _suppressCalendarMemoryChange = false;
     }
 
-    private void ActivityTimer_Tick(object? sender, EventArgs e)
+    private async void ActivityTimer_Tick(object? sender, EventArgs e)
+    {
+        await SampleActivityAsync();
+    }
+
+    private async Task SampleActivityAsync()
     {
         var now = DateTimeOffset.UtcNow;
         var elapsed = now - _lastActivitySampleUtc;
@@ -1792,12 +2313,82 @@ public partial class MainWindow : Window
         try
         {
             _activity.Record(now, elapsed, activeBookId);
-            RefreshScreenData();
+            if (_currentView == "Library") RefreshLibraryItems();
+            else if (_currentView != "Reader" && _currentView != "Explore") RefreshScreenData();
+            await _activity.SaveAsync();
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
         {
             StatusText.Text = "Reading activity could not be saved locally";
         }
+    }
+
+    private void RefreshLibraryItems()
+    {
+        var searchText = LibrarySearchBox.Text.Trim();
+        var shelfFilter = LibraryShelfPicker.SelectedItem as string;
+        var statusFilter = LibraryStatusPicker.SelectedValue as string ?? "all";
+        IEnumerable<(LibraryBookEntry Entry, int SecondsRead, bool HasProgress, ReadingPosition Position, bool IsFinished)> libraryEntries =
+            _library.Books.Select(entry => (entry, _activity.GetBookSeconds(entry.Id), _progress.Has(entry.Id),
+                _progress.Get(entry.Id), _completion.IsFinished(entry.Id)));
+
+        if (searchText.Length > 0)
+        {
+            libraryEntries = libraryEntries.Where(book => book.Entry.Title.Contains(searchText, StringComparison.CurrentCultureIgnoreCase)
+                || book.Entry.Author.Contains(searchText, StringComparison.CurrentCultureIgnoreCase)
+                || book.Entry.Series.Contains(searchText, StringComparison.CurrentCultureIgnoreCase)
+                || book.Entry.Shelves.Any(shelf => shelf.Contains(searchText, StringComparison.CurrentCultureIgnoreCase)));
+        }
+        if (!string.IsNullOrWhiteSpace(shelfFilter) && shelfFilter != "All shelves")
+            libraryEntries = libraryEntries.Where(book => book.Entry.Shelves.Contains(shelfFilter, StringComparer.CurrentCultureIgnoreCase));
+        libraryEntries = libraryEntries.Where(book => statusFilter switch
+        {
+            "reading" => (book.HasProgress || book.SecondsRead > 0) && !book.IsFinished,
+            "unread" => !book.HasProgress && book.SecondsRead == 0 && !book.IsFinished,
+            "finished" => book.IsFinished,
+            _ => true
+        });
+        libraryEntries = (LibrarySortPicker.SelectedValue as string) switch
+        {
+            "title" => libraryEntries.OrderBy(book => book.Entry.Title, StringComparer.CurrentCultureIgnoreCase),
+            "title-desc" => libraryEntries.OrderByDescending(book => book.Entry.Title, StringComparer.CurrentCultureIgnoreCase),
+            "author" => libraryEntries.OrderBy(book => book.Entry.Author, StringComparer.CurrentCultureIgnoreCase)
+                .ThenBy(book => book.Entry.Title, StringComparer.CurrentCultureIgnoreCase),
+            "rating" => libraryEntries.OrderByDescending(book => book.Entry.Rating ?? 0)
+                .ThenBy(book => book.Entry.Title, StringComparer.CurrentCultureIgnoreCase),
+            _ => libraryEntries
+        };
+
+        var visibleEntries = libraryEntries.ToArray();
+        LibraryBookItems.ItemsSource = visibleEntries.Select(book =>
+        {
+            var entry = book.Entry;
+            var coverPath = _library.CoverPath(entry);
+            var state = book.IsFinished ? "Finished" : book.HasProgress || book.SecondsRead > 0 ? "Reading" : "Unread";
+            var metadata = string.Join(" · ", new[]
+            {
+                entry.Format.ToUpperInvariant(),
+                entry.Author,
+                entry.Series,
+                entry.Rating is { } stars ? new string('★', stars) + new string('☆', 5 - stars) : "",
+                entry.Shelves.Count > 0 ? "Shelves: " + string.Join(", ", entry.Shelves) : ""
+            }.Where(value => !string.IsNullOrWhiteSpace(value)));
+            if (!book.HasProgress)
+            {
+                var status = book.SecondsRead > 0 ? $"{state} · {FormatDuration(book.SecondsRead)} tracked" : $"{state} · Not started yet";
+                return new LibraryBookItem(entry.Id, entry.Title, JoinDetails(metadata, status, "Stored on this PC"), coverPath);
+            }
+
+            var detail = _book?.Id == entry.Id
+                ? $"{_book.OverallPercent(_chapterIndex, book.Position.ScrollFraction)}% through the book · Last read {book.Position.UpdatedAt.ToLocalTime():MMM d, yyyy}"
+                : $"Chapter {book.Position.ChapterIndex + 1} · {book.Position.ScrollFraction:P0} through chapter · Last read {book.Position.UpdatedAt.ToLocalTime():MMM d, yyyy}";
+            return new LibraryBookItem(entry.Id, entry.Title, JoinDetails(metadata, state, detail), coverPath);
+        }).ToArray();
+        LibraryResultCountText.Text = $"{visibleEntries.Length} of {_library.Books.Count} books";
+        LibraryEmptyText.Text = _library.Books.Count == 0
+            ? "Your library is ready for a book. Import an EPUB or PDF from your PC to add it here."
+            : "No books match this search. Try another title or clear the search field.";
+        LibraryEmptyState.Visibility = visibleEntries.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void RefreshScreenData()
@@ -1842,64 +2433,7 @@ public partial class MainWindow : Window
             }
         }
 
-        IEnumerable<LibraryBookEntry> libraryEntries = _library.Books;
-        var searchText = LibrarySearchBox.Text.Trim();
-        if (searchText.Length > 0)
-        {
-            libraryEntries = libraryEntries.Where(entry => entry.Title.Contains(searchText, StringComparison.CurrentCultureIgnoreCase)
-                || entry.Author.Contains(searchText, StringComparison.CurrentCultureIgnoreCase)
-                || entry.Series.Contains(searchText, StringComparison.CurrentCultureIgnoreCase)
-                || entry.Shelves.Any(shelf => shelf.Contains(searchText, StringComparison.CurrentCultureIgnoreCase)));
-        }
-        var shelfFilter = LibraryShelfPicker.SelectedItem as string;
-        if (!string.IsNullOrWhiteSpace(shelfFilter) && shelfFilter != "All shelves")
-            libraryEntries = libraryEntries.Where(entry => entry.Shelves.Contains(shelfFilter, StringComparer.CurrentCultureIgnoreCase));
-        var statusFilter = LibraryStatusPicker.SelectedValue as string ?? "all";
-        libraryEntries = libraryEntries.Where(entry => statusFilter switch
-        {
-            "reading" => (_progress.Has(entry.Id) || _activity.GetBookSeconds(entry.Id) > 0) && !_completion.IsFinished(entry.Id),
-            "unread" => !_progress.Has(entry.Id) && _activity.GetBookSeconds(entry.Id) == 0 && !_completion.IsFinished(entry.Id),
-            "finished" => _completion.IsFinished(entry.Id),
-            _ => true
-        });
-        libraryEntries = (LibrarySortPicker.SelectedValue as string) switch
-        {
-            "title" => libraryEntries.OrderBy(entry => entry.Title, StringComparer.CurrentCultureIgnoreCase),
-            "title-desc" => libraryEntries.OrderByDescending(entry => entry.Title, StringComparer.CurrentCultureIgnoreCase),
-            "author" => libraryEntries.OrderBy(entry => entry.Author, StringComparer.CurrentCultureIgnoreCase).ThenBy(entry => entry.Title, StringComparer.CurrentCultureIgnoreCase),
-            "rating" => libraryEntries.OrderByDescending(entry => entry.Rating ?? 0).ThenBy(entry => entry.Title, StringComparer.CurrentCultureIgnoreCase),
-            _ => libraryEntries
-        };
-        var visibleEntries = libraryEntries.ToArray();
-        LibraryBookItems.ItemsSource = visibleEntries.Select(entry =>
-        {
-            var secondsRead = _activity.GetBookSeconds(entry.Id);
-            var state = _completion.IsFinished(entry.Id) ? "Finished" : _progress.Has(entry.Id) || secondsRead > 0 ? "Reading" : "Unread";
-            var metadata = string.Join(" · ", new[]
-            {
-                entry.Format.ToUpperInvariant(),
-                entry.Author,
-                entry.Series,
-                entry.Rating is { } stars ? new string('★', stars) + new string('☆', 5 - stars) : "",
-                entry.Shelves.Count > 0 ? "Shelves: " + string.Join(", ", entry.Shelves) : ""
-            }.Where(value => !string.IsNullOrWhiteSpace(value)));
-            if (!_progress.Has(entry.Id))
-            {
-                var status = secondsRead > 0 ? $"{state} · {FormatDuration(secondsRead)} tracked" : $"{state} · Not started yet";
-                return new LibraryBookItem(entry.Id, entry.Title, JoinDetails(metadata, status, "Stored on this PC"), _library.CoverPath(entry.Id));
-            }
-
-            var position = _progress.Get(entry.Id);
-            var detail = _book?.Id == entry.Id
-                ? $"{_book.OverallPercent(_chapterIndex, position.ScrollFraction)}% through the book · Last read {position.UpdatedAt.ToLocalTime():MMM d, yyyy}"
-                : $"Chapter {position.ChapterIndex + 1} · {position.ScrollFraction:P0} through chapter · Last read {position.UpdatedAt.ToLocalTime():MMM d, yyyy}";
-            return new LibraryBookItem(entry.Id, entry.Title, JoinDetails(metadata, state, detail), _library.CoverPath(entry.Id));
-        }).ToArray();
-        LibraryResultCountText.Text = $"{visibleEntries.Length} of {_library.Books.Count} books";
-        LibraryEmptyText.Text = _library.Books.Count == 0
-            ? "Your library is ready for a book. Import an EPUB or PDF from your PC to add it here."
-            : "No books match this search. Try another title or clear the search field.";
-        LibraryEmptyState.Visibility = visibleEntries.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        RefreshLibraryItems();
 
         var weekStart = today.AddDays(-(((int)today.DayOfWeek + 6) % 7));
         var week = _activity.GetDays(weekStart, 7);
@@ -2045,6 +2579,7 @@ public partial class MainWindow : Window
     {
         if (_pdfBook is not null)
         {
+            FullscreenButton.IsEnabled = true;
             PreviousButton.IsEnabled = false;
             NextButton.IsEnabled = false;
             BookmarkButton.Content = "Bookmark";
@@ -2061,6 +2596,7 @@ public partial class MainWindow : Window
         }
         if (_book is null || _book.Chapters.Count == 0)
         {
+            FullscreenButton.IsEnabled = false;
             PreviousButton.IsEnabled = false;
             NextButton.IsEnabled = false;
             PreviousButton.Content = "‹ Previous";
@@ -2074,6 +2610,8 @@ public partial class MainWindow : Window
             return;
         }
         var pageMode = _settings.ReadingMode == "page";
+        FullscreenButton.IsEnabled = true;
+        UpdateChapterPickerSelection();
         VocabularyButton.IsEnabled = true;
         PreviousButton.Content = pageMode ? "‹ Previous page" : "‹ Previous chapter";
         NextButton.Content = pageMode ? "Next page ›" : "Next chapter ›";
@@ -2105,6 +2643,8 @@ public partial class MainWindow : Window
         ReaderSettingsButton.IsEnabled = !isBusy;
         AddFontButton.IsEnabled = !isBusy && _pdfBook is null;
         FontPicker.IsEnabled = !isBusy && _pdfBook is null;
+        ChapterPicker.IsEnabled = !isBusy && _documentLoaded && _book is not null;
+        FullscreenButton.IsEnabled = !isBusy && (_book is not null || _pdfBook is not null);
         VocabularyButton.IsEnabled = !isBusy && _book is not null;
         PreviousButton.IsEnabled = !isBusy && _book is not null
             && (_settings.ReadingMode == "page" ? _documentLoaded : _chapterIndex > 0);
@@ -2142,7 +2682,8 @@ public partial class MainWindow : Window
 
     private async Task ApplySelectedFontAsync()
     {
-        if (_book is null || !_documentLoaded || ReaderBrowser.CoreWebView2 is null)
+        var book = _book;
+        if (book is null || !_documentLoaded || ReaderBrowser.CoreWebView2 is null)
         {
             return;
         }
@@ -2153,7 +2694,7 @@ public partial class MainWindow : Window
             if (selectedId?.StartsWith("system:", StringComparison.Ordinal) == true)
             {
                 var familyName = selectedId["system:".Length..];
-                var systemCss = $"html,body,body *{{font-family:{CssString(familyName)},serif!important;}}";
+                var systemCss = $"html,body,body *{{font-family:{CssString(familyName)},'Segoe UI','Myanmar Text',sans-serif!important;}}";
                 await SetReaderFontCssAsync(systemCss);
                 return;
             }
@@ -2168,16 +2709,20 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var fontDirectory = Path.Combine(_book.ExtractedRoot, ".wow-reader-fonts");
-            Directory.CreateDirectory(fontDirectory);
+            var fontDirectory = Path.Combine(book.ExtractedRoot, ".wow-reader-fonts");
             var extension = Path.GetExtension(fontPath);
             var localFont = Path.Combine(fontDirectory, fontId + extension);
-            File.Copy(fontPath, localFont, overwrite: true);
-            var relative = Path.GetRelativePath(_book.ExtractedRoot, localFont)
+            await Task.Run(() =>
+            {
+                Directory.CreateDirectory(fontDirectory);
+                if (!File.Exists(localFont)) File.Copy(fontPath, localFont, overwrite: false);
+            });
+            if (_book?.Id != book.Id || _fonts.SelectedFontId != fontId) return;
+            var relative = Path.GetRelativePath(book.ExtractedRoot, localFont)
                 .Replace(Path.DirectorySeparatorChar, '/');
             var escapedPath = string.Join('/', relative.Split('/').Select(Uri.EscapeDataString));
             var fontUri = $"https://{ReaderHost}/{escapedPath}";
-            var css = $"@font-face{{font-family:'WoWReaderCustom';src:url('{fontUri}') format('{format}');font-style:normal;font-weight:normal;font-display:swap;}} html,body,body *{{font-family:'WoWReaderCustom',serif!important;}}";
+            var css = $"@font-face{{font-family:'WoWReaderCustom';src:url('{fontUri}') format('{format}');font-style:normal;font-weight:normal;font-display:swap;}} html,body,body *{{font-family:'WoWReaderCustom','Segoe UI','Myanmar Text',sans-serif!important;}}";
             await SetReaderFontCssAsync(css);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException or System.Runtime.InteropServices.COMException)
@@ -2189,7 +2734,7 @@ public partial class MainWindow : Window
     private async Task SetReaderFontCssAsync(string css)
     {
         var cssLiteral = JsonSerializer.Serialize(css);
-        var script = $"(()=>{{let s=document.getElementById('wow-reader-custom-font');if(!s){{s=document.createElement('style');s.id='wow-reader-custom-font';document.head.appendChild(s);}}s.textContent={cssLiteral};document.fonts?.load('16px WoWReaderCustom');}})();";
+        var script = $"(async()=>{{let s=document.getElementById('wow-reader-custom-font');if(!s){{s=document.createElement('style');s.id='wow-reader-custom-font';document.head.appendChild(s);}}s.textContent={cssLiteral};if(document.fonts)await document.fonts.load('16px WoWReaderCustom');}})();";
         await ReaderBrowser.CoreWebView2!.ExecuteScriptAsync(script);
     }
 
@@ -2201,7 +2746,7 @@ public partial class MainWindow : Window
         }
 
         _settings.Normalize();
-        ReaderBrowser.ZoomFactor = _settings.FontSizePercent / 100d;
+        ReaderBrowser.ZoomFactor = 1d;
         var configuration = new
         {
             mode = _settings.ReadingMode,
@@ -2210,7 +2755,11 @@ public partial class MainWindow : Window
             autoScrollSpeed = AutoScrollSpeedPixels(_settings.AutoScrollSpeed),
             autoScrollWholeBook = _settings.AutoScrollWholeBook,
             nightLight = _settings.NightLight,
+            theme = _settings.Theme,
             darkTheme = _settings.Theme == "dark",
+            fontSizePercent = _settings.FontSizePercent,
+            hasPreviousChapter = _chapterIndex > 0,
+            hasNextChapter = _chapterIndex < _book.Chapters.Count - 1,
             brightness = _settings.BrightnessPercent,
             ruler = _settings.ReadingRulerEnabled,
             rulerLines = _settings.ReadingRulerLines
@@ -2220,14 +2769,19 @@ public partial class MainWindow : Window
         var script = "(()=>{const c=" + settingsJson + ";const css=" + cssJson + ";"
             + "let s=document.getElementById('wow-reader-settings');if(!s){s=document.createElement('style');s.id='wow-reader-settings';document.head.appendChild(s);}s.textContent=css;"
             + "const b=document.body,d=document.documentElement;if(!b)return;"
+            + "if(!b.dataset.wowReaderImageOnlyChecked){const readerText=(b.textContent||'').trim();b.classList.toggle('wow-reader-image-only',!!b.querySelector('img,svg')&&readerText.length<80);b.dataset.wowReaderImageOnlyChecked='1';}"
+            + "const applyTextScale=()=>{const scale=Math.max(.5,Math.min(3,(Number(c.fontSizePercent)||100)/100));if(b.dataset.wowReaderScale===String(c.fontSizePercent))return;const nodes=[b,...b.querySelectorAll('*')].filter(n=>!n.matches('img,svg,math,video,audio,canvas,iframe,object,embed,script,style,source,track,br,hr'));const sizes=nodes.map(n=>({n,base:Number(n.dataset.wowReaderBaseFontSize)||parseFloat(getComputedStyle(n).fontSize)||16}));sizes.forEach(({n,base})=>{n.dataset.wowReaderBaseFontSize=String(base);n.style.setProperty('font-size',(base*scale)+'px','important');});b.dataset.wowReaderScale=String(c.fontSizePercent);};applyTextScale();"
             + "const prep=()=>{if(c.mode==='page'){b.scrollLeft=Math.max(0,b.scrollLeft);b.scrollTop=0;}else{b.scrollLeft=0;}};prep();"
             + "window.wowReaderGetProgress=()=>{if(c.mode==='page'){const m=Math.max(0,b.scrollWidth-b.clientWidth);return m===0?0:Math.max(0,Math.min(1,b.scrollLeft/m));}const m=Math.max(0,d.scrollHeight-window.innerHeight);return m===0?0:Math.max(0,Math.min(1,window.scrollY/m));};"
             + "window.wowReaderGetPageLabel=()=>{const w=Math.max(1,b.clientWidth);const total=Math.max(1,Math.ceil(b.scrollWidth/w));const page=Math.max(1,Math.min(total,Math.floor((b.scrollLeft+2)/w)+1));return 'Page '+page+' / '+total;};"
             + "window.wowReaderRestoreProgress=f=>{f=Math.max(0,Math.min(1,Number(f)||0));if(c.mode==='page'){const m=Math.max(0,b.scrollWidth-b.clientWidth);b.scrollTo({left:Math.round(m*f),top:0,behavior:'auto'});}else{const m=Math.max(0,d.scrollHeight-window.innerHeight);window.scrollTo(0,Math.round(m*f));}};"
-            + "window.wowReaderTurnPage=direction=>{if(c.mode!=='page')return false;const m=Math.max(0,b.scrollWidth-b.clientWidth);const x=Math.max(0,Math.min(m,b.scrollLeft+(direction<0?-1:1)*Math.max(1,window.innerWidth)));if(Math.abs(x-b.scrollLeft)<2)return false;b.scrollTo({left:x,top:0,behavior:c.animation==='slide'?'smooth':'auto'});return true;};"
-            + "window.__wowReaderMode=c.mode;if(!window.__wowReaderKeysBound){window.addEventListener('keydown',e=>{if(window.__wowReaderMode!=='page'||e.altKey||e.ctrlKey||e.metaKey)return;if(e.key==='ArrowRight'&&window.wowReaderTurnPage(1)){e.preventDefault();e.stopPropagation();}else if(e.key==='ArrowLeft'&&window.wowReaderTurnPage(-1)){e.preventDefault();e.stopPropagation();}},true);window.__wowReaderKeysBound=true;}"
-            + "const markLanguageBlocks=()=>{const re=/[\\u1000-\\u109f\\ua9e0-\\ua9ff\\uaa60-\\uaa7f]/;document.querySelectorAll('p,li,blockquote,dd,dt,figcaption,td,th').forEach(n=>{const t=(n.innerText||n.textContent||'').trim();if(!t)return;n.classList.toggle('wow-reader-auto-myanmar',re.test(t));n.classList.toggle('wow-reader-auto-latin',!re.test(t));});};markLanguageBlocks();"
-            + "const updateOverlay=(id,show,css)=>{let o=document.getElementById(id);if(show){if(!o){o=document.createElement('div');o.id=id;document.body.appendChild(o);}o.style.cssText=css;}else if(o)o.remove();};"
+            + "window.wowReaderTurnPage=direction=>{if(c.mode!=='page')return false;const m=Math.max(0,b.scrollWidth-b.clientWidth),current=b.scrollLeft,step=Math.max(1,b.clientWidth);if(direction<0&&current<2||direction>0&&current>=m-2)return false;const x=Math.max(0,Math.min(m,current+(direction<0?-step:step)));if(Math.abs(x-current)<2)return false;b.scrollTo({left:x,top:0,behavior:c.animation==='slide'?'smooth':'auto'});return true;};"
+            + "const postChapter=direction=>{const allowed=direction<0?c.hasPreviousChapter:c.hasNextChapter;if(!allowed||!window.chrome?.webview)return false;if(window.__wowReaderBoundaryPending)return true;window.__wowReaderBoundaryPending=true;window.chrome.webview.postMessage(direction<0?'reader-previous':'reader-next');setTimeout(()=>{window.__wowReaderBoundaryPending=false;},1600);return true;};window.wowReaderPostChapter=postChapter;"
+            + "const step=direction=>{if(c.mode==='page'){if(window.wowReaderTurnPage(direction))return true;return postChapter(direction);}const max=Math.max(0,d.scrollHeight-window.innerHeight),current=window.scrollY;if(direction<0&&current>2||direction>0&&current<max-2){window.__wowReaderUserScrollUntil=Date.now()+320;window.scrollBy({top:(direction<0?-1:1)*Math.max(1,window.innerHeight*.82),behavior:c.animation==='slide'?'smooth':'auto'});return true;}return postChapter(direction);};window.wowReaderNavigate=step;window.__wowReaderMode=c.mode;"
+            + "if(!window.__wowReaderKeysBound){window.addEventListener('keydown',e=>{const t=e.target;if(e.altKey||e.ctrlKey||e.metaKey||t?.isContentEditable||t?.closest?.('input,textarea,select,button,a[href]'))return;let dir=0;if(e.key==='Enter')dir=e.shiftKey?-1:1;else if(['ArrowRight','ArrowDown','PageDown',' '].includes(e.key))dir=1;else if(['ArrowLeft','ArrowUp','PageUp'].includes(e.key))dir=-1;if(!dir)return;const handled=e.key==='Enter'&&window.__wowReaderMode==='scroll'?window.wowReaderPostChapter(dir):window.wowReaderNavigate(dir);if(!handled)return;e.preventDefault();e.stopPropagation();},true);window.__wowReaderKeysBound=true;}"
+            + "if(!window.__wowReaderWheelBound){let lastPageWheel=0;window.addEventListener('wheel',e=>{if(window.__wowReaderMode==='page'){const delta=Math.abs(e.deltaY)>=Math.abs(e.deltaX)?e.deltaY:e.deltaX;if(Math.abs(delta)>1){e.preventDefault();const now=performance.now();if(now-lastPageWheel>=220){lastPageWheel=now;window.wowReaderNavigate(delta>0?1:-1);}}return;}if(Math.abs(e.deltaY)>1){window.__wowReaderUserScrollUntil=Date.now()+320;const max=Math.max(0,document.documentElement.scrollHeight-window.innerHeight);if(e.deltaY>0&&window.scrollY>=max-2)window.wowReaderNavigate(1);else if(e.deltaY<0&&window.scrollY<=2)window.wowReaderNavigate(-1);}}, {passive:false});window.addEventListener('scroll',()=>{if(window.__wowReaderMode!=='scroll'||Date.now()>(window.__wowReaderUserScrollUntil||0)||window.__wowReaderBoundaryPending)return;const max=Math.max(0,document.documentElement.scrollHeight-window.innerHeight);if(window.scrollY>=max-2)window.wowReaderNavigate(1);else if(window.scrollY<=2)window.wowReaderNavigate(-1);},{passive:true});window.__wowReaderWheelBound=true;}"
+            + "if(!b.dataset.wowReaderLanguageScanned){b.dataset.wowReaderLanguageScanned='1';const re=/[\\u1000-\\u109f\\ua9e0-\\ua9ff\\uaa60-\\uaa7f]/;const nodes=document.querySelectorAll('p,li,blockquote,dd,dt,figcaption,td,th');let i=0;const scan=deadline=>{let count=0;while(i<nodes.length&&count<80&&(deadline.didTimeout||deadline.timeRemaining()>1)){const n=nodes[i++],t=(n.textContent||'').trim();if(t){const myanmar=re.test(t);n.classList.toggle('wow-reader-auto-myanmar',myanmar);n.classList.toggle('wow-reader-auto-latin',!myanmar);}count++;}if(i<nodes.length){if(window.requestIdleCallback)window.requestIdleCallback(scan,{timeout:1500});else setTimeout(()=>scan({didTimeout:true,timeRemaining:()=>0}),0);}};if(window.requestIdleCallback)window.requestIdleCallback(scan,{timeout:1500});else setTimeout(()=>scan({didTimeout:true,timeRemaining:()=>0}),0);}"
+            + "const updateOverlay=(id,show,css)=>{let o=document.getElementById(id);if(show){if(!o){o=document.createElement('div');o.id=id;o.dataset.wowReaderOverlay='true';document.body.appendChild(o);}o.style.cssText=css;}else if(o)o.remove();};"
             + "const updateDisplay=()=>{const h=new Date().getHours();const night=c.nightLight==='on'||(c.nightLight==='auto'&&(h>=19||h<6));updateOverlay('wow-reader-night-overlay',night&&!c.darkTheme,'position:fixed;inset:0;z-index:2147483646;pointer-events:none;background:rgba(255,145,40,.095);');const dim=c.brightness<0?0:Math.max(0,1-c.brightness/100);updateOverlay('wow-reader-dim-overlay',dim>0,'position:fixed;inset:0;z-index:2147483647;pointer-events:none;background:rgba(0,0,0,'+dim+');');if(c.ruler){const lh=parseFloat(getComputedStyle(b).lineHeight)||24;const height=Math.max(1,c.rulerLines)*lh;updateOverlay('wow-reader-ruler',true,'position:fixed;left:0;right:0;top:42%;height:'+height+'px;z-index:2147483645;pointer-events:none;box-sizing:border-box;background:rgba(250,220,120,.13);border-top:1px solid rgba(120,100,50,.26);border-bottom:1px solid rgba(120,100,50,.26);');}else updateOverlay('wow-reader-ruler',false,'');};updateDisplay();if(window.__wowDisplayTimer)clearInterval(window.__wowDisplayTimer);window.__wowDisplayTimer=setInterval(updateDisplay,60000);"
             + "if(window.__wowAutoTimer)clearInterval(window.__wowAutoTimer);window.__wowAutoTimer=null;window.__wowPausedUntil=0;"
             + "if(!window.__wowInteractionPauseBound){const pause=()=>{window.__wowPausedUntil=Date.now()+3500;};['wheel','pointerdown','touchstart','keydown'].forEach(k=>window.addEventListener(k,pause,{passive:true}));window.__wowInteractionPauseBound=true;}"
@@ -2250,6 +2804,7 @@ public partial class MainWindow : Window
             "sepia" => ("#F4ECD8", "#4A4033"),
             "dark" => ("#121212", "#E8EAED"),
             "eink" => ("#E6E5DE", "#2C3130"),
+            "premium" => ("#EDF3EC", "#20382B"),
             "custom" => ("#FAFAFA", "#202124"),
             _ => ("#FFFFFF", "#202124")
         };
@@ -2260,7 +2815,9 @@ public partial class MainWindow : Window
         var css = new StringBuilder()
             .Append("html,body{background-color:").Append(background).Append("!important;color:").Append(foreground).Append("!important;}")
             .Append("body,body *{color:").Append(foreground).Append("!important;}")
-            .Append("body a{color:").Append(_settings.Theme == "dark" ? "#9CC7FF" : "#245B9E").Append("!important;}");
+            .Append("body a{color:").Append(_settings.Theme == "dark" ? "#9CC7FF" : _settings.Theme == "premium" ? "#226949" : "#245B9E").Append("!important;}")
+            .Append("*,*::before,*::after{break-before:auto!important;break-after:auto!important;page-break-before:auto!important;page-break-after:auto!important;-webkit-column-break-before:auto!important;-webkit-column-break-after:auto!important;}")
+            .Append("body img,body video,body svg{max-width:90vw!important;max-height:85vh!important;object-fit:contain!important;height:auto!important;}");
 
         if (_settings.FormattingMode == "reader")
         {
@@ -2289,19 +2846,39 @@ public partial class MainWindow : Window
 
         if (_settings.ReadingMode == "page")
         {
+            var pageMargin = margin + "vw";
             css.Append("html{height:100%!important;overflow:hidden!important;}")
-                .Append("body{height:100vh!important;max-height:100vh!important;overflow-x:auto!important;overflow-y:hidden!important;")
-                .Append("column-count:auto!important;column-width:100vw!important;column-gap:0!important;column-fill:auto!important;")
-                .Append("box-sizing:border-box!important;margin-top:0!important;margin-bottom:0!important;padding-top:5vh!important;padding-bottom:5vh!important;}")
-                .Append("body img,body video,body table{max-width:90vw;}");
+                .Append("body{width:100vw!important;min-width:100vw!important;box-sizing:border-box!important;height:100vh!important;max-height:100vh!important;overflow-x:auto!important;overflow-y:hidden!important;")
+                .Append("column-count:auto!important;column-width:calc(100vw - ").Append(pageMargin).Append(" - ").Append(pageMargin).Append(")!important;")
+                .Append("column-gap:calc(").Append(pageMargin).Append(" + ").Append(pageMargin).Append(")!important;column-fill:auto!important;")
+                .Append("margin:0!important;padding:5vh ").Append(pageMargin).Append("!important;}")
+                .Append("body img,body video,body svg{max-width:calc(100vw - ").Append(pageMargin).Append(" - ").Append(pageMargin).Append(")!important;max-height:90vh!important;")
+                .Append("width:auto!important;height:auto!important;object-fit:contain!important;display:block!important;margin-left:auto!important;margin-right:auto!important;")
+                .Append("break-inside:avoid!important;page-break-inside:avoid!important;-webkit-column-break-inside:avoid!important;}")
+                .Append("body.wow-reader-image-only>:not([data-wow-reader-overlay]){height:auto!important;min-height:0!important;max-height:90vh!important;overflow:visible!important;break-inside:avoid!important;page-break-inside:avoid!important;}");
         }
         else
         {
             css.Append("html{height:auto!important;overflow-x:hidden!important;overflow-y:auto!important;}")
-                .Append("body{height:auto!important;max-height:none!important;overflow-x:hidden!important;overflow-y:visible!important;")
+                .Append("body{width:auto!important;min-width:0!important;height:auto!important;max-height:none!important;overflow-x:hidden!important;overflow-y:visible!important;")
                 .Append("column-count:auto!important;column-width:auto!important;column-gap:normal!important;}");
         }
         return css.ToString();
+    }
+
+    private async Task RestoreReaderFragmentAsync(string fragment)
+    {
+        if (ReaderBrowser.CoreWebView2 is null || !_documentLoaded || string.IsNullOrWhiteSpace(fragment)) return;
+        var fragmentJson = JsonSerializer.Serialize(fragment);
+        try
+        {
+            await ReaderBrowser.CoreWebView2.ExecuteScriptAsync(
+                $"(()=>{{const f={fragmentJson};let e=document.getElementById(f);if(!e)e=document.getElementsByName(f)[0];if(e)e.scrollIntoView({{block:'start',behavior:'auto'}});}})();");
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or COMException)
+        {
+            // The target may have been removed by EPUB sanitization; keep chapter navigation available.
+        }
     }
 
     private async Task RestoreReaderPositionAsync(double fraction)
@@ -2407,7 +2984,16 @@ public partial class MainWindow : Window
 
     private async void CoreWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
-        if (e.TryGetWebMessageAsString() == "autoscroll-next" && _settings.AutoScrollWholeBook
+        var message = e.TryGetWebMessageAsString();
+        if (message == "reader-next")
+        {
+            await TurnOrNavigateAsync(1);
+        }
+        else if (message == "reader-previous")
+        {
+            await TurnOrNavigateAsync(-1);
+        }
+        else if (message == "autoscroll-next" && _settings.AutoScrollWholeBook
             && _settings.ReadingMode == "scroll" && _book is not null && _chapterIndex < _book.Chapters.Count - 1)
         {
             await TurnOrNavigateAsync(1);
@@ -2431,5 +3017,9 @@ public partial class MainWindow : Window
         return Path.GetFullPath(Path.Combine(_book.ExtractedRoot, relative));
     }
 
+    private sealed record ChapterPickerItem(int Index, string Title);
     private sealed record FontPickerItem(string Id, string Name);
+    private sealed record ReaderFullscreenState(WindowStyle WindowStyle, ResizeMode ResizeMode, WindowState WindowState,
+        Rect RestoreBounds, Visibility AppHeaderVisibility, Visibility AppFooterVisibility, Visibility ReaderToolbarVisibility,
+        Thickness ReaderPageSurfaceMargin, Thickness ReaderPageSurfaceBorderThickness, CornerRadius ReaderPageSurfaceCornerRadius);
 }

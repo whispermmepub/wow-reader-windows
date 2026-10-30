@@ -2,13 +2,14 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media;
 using WowReader.Windows.Models;
 
 namespace WowReader.Windows;
 
 public partial class ReaderSettingsWindow : Window
 {
-    private bool _isInitializing;
+    private bool _isInitializing = true;
     private readonly bool _hasCurrentBook;
 
     public ReaderSettings Settings { get; private set; }
@@ -17,6 +18,7 @@ public partial class ReaderSettingsWindow : Window
 
     public ReaderSettingsWindow(ReaderSettings current, bool hasCurrentBook = false, bool hasTypographyOverride = false)
     {
+        ArgumentNullException.ThrowIfNull(current);
         InitializeComponent();
         _hasCurrentBook = hasCurrentBook;
         BookTypographyOverrideCheck.IsEnabled = hasCurrentBook;
@@ -57,6 +59,7 @@ public partial class ReaderSettingsWindow : Window
         _isInitializing = false;
         UpdateValueLabels();
         UpdateDependentEnabledState();
+        UpdateAppearancePreview();
     }
 
     private void ApplyButton_Click(object sender, RoutedEventArgs e)
@@ -137,6 +140,47 @@ public partial class ReaderSettingsWindow : Window
         }
     }
 
+    private void ThemePicker_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_isInitializing && ThemePicker is not null && CustomTextColorBox is not null
+            && CustomBackgroundColorBox is not null && Selected(ThemePicker, "light") != "custom")
+        {
+            CustomTextColorBox.Clear();
+            CustomBackgroundColorBox.Clear();
+        }
+        UpdateAppearancePreview();
+        if (!_isInitializing) UpdateDependentEnabledState();
+    }
+
+    private void ColorBox_TextChanged(object sender, TextChangedEventArgs e) => UpdateAppearancePreview();
+
+    private void UpdateAppearancePreview()
+    {
+        if (ThemePicker is null || CustomTextColorBox is null || CustomBackgroundColorBox is null
+            || AppearancePreviewBorder is null || AppearancePreviewText is null) return;
+        var (background, foreground) = Selected(ThemePicker, "light") switch
+        {
+            "sepia" => ("#F4ECD8", "#4A4033"),
+            "dark" => ("#121212", "#E8EAED"),
+            "eink" => ("#E6E5DE", "#2C3130"),
+            "premium" => ("#EDF3EC", "#20382B"),
+            "custom" => ("#FAFAFA", "#202124"),
+            _ => ("#FFFFFF", "#202124")
+        };
+        AppearancePreviewBorder.Background = new SolidColorBrush(ParsePreviewColor(CustomBackgroundColorBox.Text, background));
+        AppearancePreviewText.Foreground = new SolidColorBrush(ParsePreviewColor(CustomTextColorBox.Text, foreground));
+    }
+
+    private static Color ParsePreviewColor(string? value, string fallback)
+    {
+        var candidate = string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+        if (!TryReadColor(candidate, out var normalized)) normalized = fallback;
+        return Color.FromRgb(
+            byte.Parse(normalized.AsSpan(1, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+            byte.Parse(normalized.AsSpan(3, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture),
+            byte.Parse(normalized.AsSpan(5, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+    }
+
     private void ControlChanged(object sender, RoutedEventArgs e)
     {
         if (!_isInitializing)
@@ -145,16 +189,19 @@ public partial class ReaderSettingsWindow : Window
         }
     }
 
-    private void FontSizeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) => UpdateValueLabels();
-    private void FontWeightSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) => UpdateValueLabels();
-    private void LineHeightSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) => UpdateValueLabels();
-    private void MarginSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) => UpdateValueLabels();
-    private void AutoScrollSpeedSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) => UpdateValueLabels();
-    private void RulerLinesSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) => UpdateValueLabels();
+    private void FontSizeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) { if (!_isInitializing) UpdateValueLabels(); }
+    private void FontWeightSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) { if (!_isInitializing) UpdateValueLabels(); }
+    private void LineHeightSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) { if (!_isInitializing) UpdateValueLabels(); }
+    private void MarginSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) { if (!_isInitializing) UpdateValueLabels(); }
+    private void AutoScrollSpeedSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) { if (!_isInitializing) UpdateValueLabels(); }
+    private void RulerLinesSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) { if (!_isInitializing) UpdateValueLabels(); }
 
     private void UpdateValueLabels()
     {
-        if (FontSizeValue is null)
+        if (_isInitializing || FontSizeSlider is null || FontWeightSlider is null || LineHeightSlider is null
+            || MarginSlider is null || AutoScrollSpeedSlider is null || RulerLinesSlider is null
+            || FontSizeValue is null || FontWeightValue is null || LineHeightValue is null
+            || MarginValue is null || AutoScrollSpeedValue is null || RulerLinesValue is null)
         {
             return;
         }
@@ -168,6 +215,14 @@ public partial class ReaderSettingsWindow : Window
 
     private void UpdateDependentEnabledState()
     {
+        if (ReadingModePicker is null || AutoScrollCheck is null || AutoScrollSpeedSlider is null
+            || AutoScrollScopePicker is null || FormattingPicker is null || FontWeightSlider is null
+            || LineHeightSlider is null || MarginSlider is null || AlignmentPicker is null
+            || AutoSpacingCheck is null || DailyReminderEnabledCheck is null || DailyReminderTimeBox is null
+            || DailyReminderOnlyIfUnreadCheck is null || DailyReminderStreakNudgeCheck is null)
+        {
+            return;
+        }
         var scrollMode = Selected(ReadingModePicker, "page") == "scroll";
         AutoScrollCheck.IsEnabled = scrollMode;
         AutoScrollSpeedSlider.IsEnabled = scrollMode && AutoScrollCheck.IsChecked == true;

@@ -15,11 +15,16 @@ public sealed class ReadingActivityStore
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private const string DateFormat = "yyyy-MM-dd";
     private readonly Dictionary<string, ActivityDay> _days = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _bookSeconds = new(StringComparer.Ordinal);
+    private readonly object _dataLock = new();
+    private readonly object _saveQueueLock = new();
+    private Task _pendingSave = Task.CompletedTask;
 
     public void Load()
     {
         AppPaths.EnsureCreated();
         _days.Clear();
+        _bookSeconds.Clear();
         try
         {
             var data = JsonSerializer.Deserialize<ActivityData>(File.ReadAllText(AppPaths.ActivityFile));
@@ -45,6 +50,11 @@ public sealed class ReadingActivityStore
                         .Where(item => IsSafeBookId(item.Key) && item.Value > 0)
                         .ToDictionary(item => item.Key, item => item.Value, StringComparer.Ordinal);
                     _days[date] = activity;
+                    foreach (var (bookId, seconds) in activity.BookSeconds)
+                    {
+                        _bookSeconds.TryGetValue(bookId, out var total);
+                        _bookSeconds[bookId] = checked(total + seconds);
+                    }
                 }
             }
         }
@@ -73,27 +83,31 @@ public sealed class ReadingActivityStore
 
         var localTimestamp = timestamp.ToLocalTime();
         var dateKey = localTimestamp.ToString(DateFormat, CultureInfo.InvariantCulture);
-        if (!_days.TryGetValue(dateKey, out var day))
+        lock (_dataLock)
         {
-            day = new ActivityDay();
-            _days[dateKey] = day;
-        }
+            if (!_days.TryGetValue(dateKey, out var day))
+            {
+                day = new ActivityDay();
+                _days[dateKey] = day;
+            }
 
-        if (day.LastRecordedAtUtc is null
-            || timestamp - day.LastRecordedAtUtc.Value > TimeSpan.FromMinutes(15))
-        {
-            day.Sessions++;
-        }
+            if (day.LastRecordedAtUtc is null
+                || timestamp - day.LastRecordedAtUtc.Value > TimeSpan.FromMinutes(15))
+            {
+                day.Sessions++;
+            }
 
-        day.Seconds = checked(day.Seconds + seconds);
-        day.LastRecordedAtUtc = timestamp.ToUniversalTime();
-        if (!day.BookIds.Contains(bookId, StringComparer.Ordinal))
-        {
-            day.BookIds.Add(bookId);
+            day.Seconds = checked(day.Seconds + seconds);
+            day.LastRecordedAtUtc = timestamp.ToUniversalTime();
+            if (!day.BookIds.Contains(bookId, StringComparer.Ordinal))
+            {
+                day.BookIds.Add(bookId);
+            }
+            day.BookSeconds.TryGetValue(bookId, out var previousBookSeconds);
+            day.BookSeconds[bookId] = checked(previousBookSeconds + seconds);
+            _bookSeconds.TryGetValue(bookId, out var previousTotal);
+            _bookSeconds[bookId] = checked(previousTotal + seconds);
         }
-        day.BookSeconds.TryGetValue(bookId, out var previousBookSeconds);
-        day.BookSeconds[bookId] = checked(previousBookSeconds + seconds);
-        Save();
     }
 
     public int GetSeconds(DateOnly date) => _days.TryGetValue(Key(date), out var day) ? day.Seconds : 0;
@@ -145,18 +159,13 @@ public sealed class ReadingActivityStore
         }
     }
 
-    public IReadOnlyList<BookReadingSummary> BooksByTime(int limit = 10) => _days.Values
-        .SelectMany(day => day.BookSeconds)
-        .GroupBy(item => item.Key, StringComparer.Ordinal)
-        .Select(group => new BookReadingSummary(group.Key, group.Sum(item => item.Value)))
+    public IReadOnlyList<BookReadingSummary> BooksByTime(int limit = 10) => _bookSeconds
+        .Select(item => new BookReadingSummary(item.Key, item.Value))
         .OrderByDescending(item => item.Seconds)
         .Take(Math.Clamp(limit, 0, 100))
         .ToArray();
 
-    public int GetBookSeconds(string bookId) => _days.Values
-        .SelectMany(day => day.BookSeconds)
-        .Where(item => string.Equals(item.Key, bookId, StringComparison.Ordinal))
-        .Sum(item => item.Value);
+    public int GetBookSeconds(string bookId) => _bookSeconds.TryGetValue(bookId, out var seconds) ? seconds : 0;
 
     public int CurrentStreak(DateOnly today)
     {
@@ -170,13 +179,43 @@ public sealed class ReadingActivityStore
         return streak;
     }
 
-    private void Save()
+    public Task SaveAsync()
     {
-        AppPaths.EnsureCreated();
-        var temporary = AppPaths.ActivityFile + ".tmp";
-        var data = new ActivityData { Days = _days };
-        File.WriteAllText(temporary, JsonSerializer.Serialize(data, JsonOptions));
-        File.Move(temporary, AppPaths.ActivityFile, overwrite: true);
+        lock (_saveQueueLock)
+        {
+            var previous = _pendingSave;
+            _pendingSave = Task.Run(async () =>
+            {
+                if (!previous.IsCompleted)
+                {
+                    try { await previous.ConfigureAwait(false); }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+
+                ActivityData snapshot;
+                lock (_dataLock)
+                {
+                    snapshot = new ActivityData
+                    {
+                        Days = _days.ToDictionary(pair => pair.Key, pair => new ActivityDay
+                        {
+                            Seconds = pair.Value.Seconds,
+                            Sessions = pair.Value.Sessions,
+                            LastRecordedAtUtc = pair.Value.LastRecordedAtUtc,
+                            BookIds = pair.Value.BookIds.ToList(),
+                            BookSeconds = new Dictionary<string, int>(pair.Value.BookSeconds, StringComparer.Ordinal)
+                        }, StringComparer.Ordinal)
+                    };
+                }
+
+                AppPaths.EnsureCreated();
+                var temporary = AppPaths.ActivityFile + ".tmp";
+                File.WriteAllText(temporary, JsonSerializer.Serialize(snapshot, JsonOptions));
+                File.Move(temporary, AppPaths.ActivityFile, overwrite: true);
+            });
+            return _pendingSave;
+        }
     }
 
     private static string Key(DateOnly date) => date.ToString(DateFormat, CultureInfo.InvariantCulture);

@@ -66,7 +66,8 @@ public sealed class LocalLibraryStore
             var json = File.ReadAllText(AppPaths.CatalogFile);
             _data = JsonSerializer.Deserialize<CatalogData>(json) ?? new CatalogData();
             _data.Books = _data.Books
-                .Where(book => book is not null && IsSafeId(book.Id) && File.Exists(BookPath(book.Id)))
+                .Where(book => book is not null && IsSafeId(book.Id)
+                    && File.Exists(book.Format == "pdf" ? PdfBookPath(book.Id) : Path.Combine(AppPaths.Books, book.Id + ".epub")))
                 .Select(NormalizeEntry)
                 .GroupBy(book => book.Id, StringComparer.Ordinal)
                 .Select(group => group.First())
@@ -139,8 +140,12 @@ public sealed class LocalLibraryStore
 
     public string? CoverPath(string id)
     {
-        var entry = Get(id);
-        if (entry is null || !IsSafeCoverName(id, entry.CoverFileName)) return null;
+        return CoverPath(Get(id));
+    }
+
+    public string? CoverPath(LibraryBookEntry? entry)
+    {
+        if (entry is null || !IsSafeId(entry.Id) || !IsSafeCoverName(entry.Id, entry.CoverFileName)) return null;
         var path = Path.Combine(AppPaths.Covers, entry.CoverFileName);
         return File.Exists(path) ? path : null;
     }

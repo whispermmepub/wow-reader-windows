@@ -47,7 +47,7 @@ public sealed class ReaderSettings
         MarginPercent = Math.Clamp(MarginPercent, 1, 14);
         FormattingMode = OneOf(FormattingMode, "original", "reader");
         TextAlignment = OneOf(TextAlignment, "original", "justify", "left", "right");
-        Theme = OneOf(Theme, "light", "sepia", "dark", "eink", "custom");
+        Theme = OneOf(Theme, "light", "sepia", "dark", "eink", "premium", "custom");
         CustomTextColor = NormalizeHexColor(CustomTextColor);
         CustomBackgroundColor = NormalizeHexColor(CustomBackgroundColor);
         NightLight = OneOf(NightLight, "off", "auto", "on");
@@ -57,6 +57,7 @@ public sealed class ReaderSettings
         PositionDisplayMode = Math.Clamp(PositionDisplayMode, 0, 2);
         DailyReadingReminderHour = Math.Clamp(DailyReadingReminderHour, 0, 23);
         DailyReadingReminderMinute = Math.Clamp(DailyReadingReminderMinute, 0, 59);
+        DailyReminderLastDeliveredDate ??= "";
         DailyReminderLastDeliveredDate = DateOnly.TryParseExact(DailyReminderLastDeliveredDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _)
             ? DailyReminderLastDeliveredDate
             : "";

@@ -2,14 +2,21 @@ namespace WowReader.Windows.Models;
 
 public sealed record EpubChapter(string ArchivePath, string Title, string LocalPath, long Weight);
 
+public sealed record EpubNavigationItem(string Title, int ChapterIndex, string Fragment, int Depth);
+
 public sealed record EpubBook(
     string Id,
     string Title,
     string SourcePath,
     string ExtractedRoot,
     IReadOnlyList<EpubChapter> Chapters,
-    string Author = "")
+    string Author = "",
+    IReadOnlyList<EpubNavigationItem>? Navigation = null)
 {
+    public IReadOnlyList<EpubNavigationItem> Contents => Navigation is { Count: > 0 }
+        ? Navigation
+        : Chapters.Select((chapter, index) => new EpubNavigationItem(chapter.Title, index, "", 0)).ToArray();
+
     public int OverallPercent(int chapterIndex, double chapterFraction)
     {
         if (Chapters.Count == 0)
